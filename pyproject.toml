@@ -35,9 +35,6 @@ full = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/leeguooooo/claude-code-usage-bar"
-Repository = "https://github.com/leeguooooo/claude-code-usage-bar"
-Issues = "https://github.com/leeguooooo/claude-code-usage-bar/issues"
 
 [project.scripts]
 claude-statusbar = "claude_statusbar.cli:main"

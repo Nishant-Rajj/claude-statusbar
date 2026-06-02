@@ -763,103 +763,6 @@ print("")
     
     return f"{hours}h {mins:02d}m"
 
-# Auto-update is rate-limited to once per machine per day. We use the mtime
-# of `last_update_check` as the timestamp — touching it before the slow
-# urlopen+pip work means N concurrent new sessions only fire ONE check
-# (the first one to win the touch race; the rest see a fresh mtime and skip).
-_UPDATE_CHECK_INTERVAL_S = 24 * 3600
-
-
-_ENSURE_STATUSLINE_INTERVAL_S = 24 * 60 * 60  # once per day
-
-
-def _maybe_ensure_statusline():
-    """Throttle settings.json check to once per day.
-
-    `ensure_statusline_configured()` reads + parses settings.json on every
-    render — and importing setup pulls in cache + atomic_write_text. At 1Hz
-    refresh that's pure waste; settings rarely change. Use a timestamp marker
-    like check_for_updates does, so the heavy imports only happen on the
-    daily tick.
-    """
-    try:
-        cache_dir = Path.home() / '.cache' / 'claude-statusbar'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        marker = cache_dir / 'last_statusline_check'
-        if marker.exists():
-            try:
-                if _time_now() - marker.stat().st_mtime < _ENSURE_STATUSLINE_INTERVAL_S:
-                    return
-            except OSError:
-                pass
-        marker.touch()
-    except OSError:
-        pass
-    try:
-        from .setup import ensure_statusline_configured
-        ensure_statusline_configured()
-    except Exception:
-        pass
-
-
-def check_for_updates(session_id: str = ''):
-    """Check for updates at most once per machine per 24 hours.
-
-    Disabled by setting env CLAUDE_STATUSBAR_NO_UPDATE=1 or
-    passing --no-auto-update on the CLI.
-
-    Concurrency notes
-    -----------------
-    Previously this was gated by session_id, so opening 5 new Claude Code
-    windows simultaneously would fire 5 parallel pip installs. The timestamp
-    gate fixes that: whichever cs gets to update the timestamp first wins;
-    everyone else sees a fresh marker and bails before running urlopen / pip.
-    """
-    env_val = os.environ.get('CLAUDE_STATUSBAR_NO_UPDATE', '').lower()
-    if env_val in ('1', 'true', 'yes'):
-        return
-
-    try:
-        cache_dir = Path.home() / '.cache' / 'claude-statusbar'
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        marker = cache_dir / 'last_update_check'
-
-        # Skip if last check was within the interval.
-        if marker.exists():
-            try:
-                age = _time_now() - marker.stat().st_mtime
-                if age < _UPDATE_CHECK_INTERVAL_S:
-                    return
-            except OSError:
-                pass
-
-        # Touch the marker BEFORE the slow operation. Two consequences:
-        #   1. A hung urlopen/pip can't trap us in a re-trigger loop on
-        #      next render — the marker is already fresh.
-        #   2. Concurrent sessions that arrive a few ms later see the
-        #      fresh mtime and skip. (Race window is tiny but exists; if
-        #      it matters we'd switch to fcntl.flock.)
-        try:
-            marker.touch()
-        except OSError:
-            return  # if we can't even touch the marker, don't try the upgrade
-
-        from .updater import check_and_upgrade
-        success, message = check_and_upgrade()
-
-        if success:
-            print(f"🔄 {message}", file=sys.stderr)
-
-    except Exception:
-        # Silently fail - don't interrupt main functionality
-        pass
-
-
-def _time_now() -> float:
-    """Indirection so tests can monkeypatch."""
-    import time as _t
-    return _t.time()
-
 def build_json_output(usage_data: Dict[str, Any], reset_time: str, model: str, display_name: str) -> Dict[str, Any]:
     """Create machine-readable payload."""
     return {
@@ -1112,11 +1015,8 @@ def main(json_output: bool = False,
          _suppress_side_effects: bool = False):
     """Main render entry point.
 
-    `_suppress_side_effects` is set by the daemon mode (Phase B): when the
-    long-lived daemon is doing the rendering, we don't want it firing the
-    per-render auto-update / settings-repair checks (those run on their own
-    cadence elsewhere, and the daemon shouldn't accidentally re-trigger them
-    1Hz).
+    `_suppress_side_effects` is accepted for API compatibility with daemon.py
+    callers but has no effect — auto-update and settings-repair are disabled.
     """
     """Main function"""
     from . import config as _cfg
@@ -1185,13 +1085,6 @@ def main(json_output: bool = False,
         )
 
     try:
-        if not json_output and not _suppress_side_effects:
-            check_for_updates(stdin_data.get('session_id', ''))
-            # Silently restore statusLine config if a Claude Code upgrade wiped
-            # it. Throttled to once per day — settings.json doesn't change
-            # often, and at 1Hz refresh the read+parse adds up.
-            _maybe_ensure_statusline()
-
         has_official = (stdin_data.get('rate_limit_pct') is not None or
                         stdin_data.get('rate_limit_7d_pct') is not None)
 
