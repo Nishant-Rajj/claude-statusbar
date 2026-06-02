@@ -683,15 +683,8 @@ def run_forever(render_interval: float = DEFAULT_RENDER_INTERVAL) -> int:
                     pass
             if t0 - last_maint > GC_INTERVAL_S:
                 _gc_orphan_tmp_files()
-                # The daemon is the long-lived process, so it owns the periodic
-                # auto-update check (the per-render path suppresses side effects
-                # in daemon mode). check_for_updates is 24h-throttled and only
-                # SPAWNS a detached upgrade, so this never blocks the loop.
-                try:
-                    from .core import check_for_updates
-                    check_for_updates()
-                except Exception:
-                    pass
+                # Auto-update is disabled in this local fork (see
+                # .security/patches.md Patch 2) — no periodic upgrade check here.
                 last_maint = t0
             if t0 - last_gc > GC_INTERVAL_S:
                 _gc_old_sessions()

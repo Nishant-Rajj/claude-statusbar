@@ -40,11 +40,6 @@ hud = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/leeguooooo/claude-code-usage-bar"
-Repository = "https://github.com/leeguooooo/claude-code-usage-bar"
-Issues = "https://github.com/leeguooooo/claude-code-usage-bar/issues"
-Changelog = "https://github.com/leeguooooo/claude-code-usage-bar/blob/main/CHANGELOG.md"
-Releases = "https://github.com/leeguooooo/claude-code-usage-bar/releases"
 
 [project.scripts]
 claude-statusbar = "claude_statusbar.cli:main"
