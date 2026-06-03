@@ -874,6 +874,7 @@ def get_cache_age_text(ttl_seconds: Optional[int] = None) -> str:
     if info is None:
         return "COLD"
     age_s, detected_ttl = info
+
     # Formatting (countdown + clock-skew clamp + COLD) is shared with the
     # merged single-scan render path so both produce identical output.
     from .activity import format_cache_countdown

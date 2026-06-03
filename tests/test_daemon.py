@@ -826,28 +826,15 @@ def test_render_payload_captures_stdout(monkeypatch):
     )
 
 
-def test_suppress_side_effects_skips_update_check(monkeypatch, tmp_path: Path):
-    """_suppress_side_effects=True must skip both check_for_updates and
-    _maybe_ensure_statusline (the daemon path runs them on its own cadence)."""
+def test_auto_update_removed_from_core():
+    """check_for_updates and _maybe_ensure_statusline must not exist in core —
+    they were removed as a security patch (no silent PyPI upgrades)."""
     import claude_statusbar.core as core_mod
-    update_calls = []
-    statusline_calls = []
-    monkeypatch.setattr(core_mod, "check_for_updates",
-                        lambda *a, **kw: update_calls.append(True))
-    monkeypatch.setattr(core_mod, "_maybe_ensure_statusline",
-                        lambda *a, **kw: statusline_calls.append(True))
-
-    # Pipe a minimal stdin payload.
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    try:
-        core_mod.main(_suppress_side_effects=True)
-    except Exception:
-        # The render path may fail because we mocked things — that's OK.
-        # We're only checking the side-effect guard here.
-        pass
-    assert update_calls == [], "_suppress_side_effects must skip check_for_updates"
-    assert statusline_calls == [], (
-        "_suppress_side_effects must skip _maybe_ensure_statusline"
+    assert not hasattr(core_mod, "check_for_updates"), (
+        "check_for_updates was re-introduced in core — security patch broken"
+    )
+    assert not hasattr(core_mod, "_maybe_ensure_statusline"), (
+        "_maybe_ensure_statusline was re-introduced in core — security patch broken"
     )
 
 
@@ -895,13 +882,16 @@ def test_ip_heartbeat_gated_on_show_ip_risk(tmp_path, monkeypatch):
 
 
 def test_maintenance_runs_on_the_first_tick(monkeypatch, tmp_path: Path):
-    """Orphan-tmp GC and the update check must fire on the daemon's first tick.
+    """Orphan-tmp GC must fire on the daemon's first tick.
 
-    They used to share the session-GC timer, which is seeded to `now` and only
+    It used to share the session-GC timer, which is seeded to `now` and only
     fires after 30 minutes. But the thin client SIGTERMs this daemon whenever it
-    spots code drift, so it seldom lives that long — the tmp sweep and the
-    auto-update check were starved and effectively never ran. Observed live: 15
-    orphaned .tmp files, oldest 99 min, against a 60-minute cutoff.
+    spots code drift, so it seldom lives that long — the tmp sweep was starved
+    and effectively never ran. Observed live: 15 orphaned .tmp files, oldest 99
+    min, against a 60-minute cutoff.
+
+    The auto-update check that used to share this timer was removed as a
+    security patch (no silent PyPI upgrades) — see test_auto_update_removed_from_core.
     """
     monkeypatch.setattr(_d, "_acquire_pidfile", lambda: True)
     monkeypatch.setattr(_d, "_release_pidfile", lambda: None, raising=False)
@@ -912,9 +902,6 @@ def test_maintenance_runs_on_the_first_tick(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(_d, "_gc_orphan_tmp_files", lambda: calls.append("tmp_gc"))
     monkeypatch.setattr(_d, "_gc_old_sessions", lambda: calls.append("session_gc"))
 
-    import claude_statusbar.core as core
-    monkeypatch.setattr(core, "check_for_updates", lambda: calls.append("update_check"))
-
     # Render once, then break out of the loop.
     def _one_tick():
         _d._running = False
@@ -923,7 +910,6 @@ def test_maintenance_runs_on_the_first_tick(monkeypatch, tmp_path: Path):
     _d.run_forever(render_interval=0.0)
 
     assert "tmp_gc" in calls, "orphan-tmp GC must not wait 30 minutes"
-    assert "update_check" in calls, "update check must not wait 30 minutes"
     # Session GC keeps its deferral — it can race a mid-restart Claude Code window.
     assert "session_gc" not in calls
 
@@ -948,9 +934,6 @@ def test_clock_advancing_between_guard_and_sleep_does_not_crash(monkeypatch):
     monkeypatch.setattr(_d, "_gc_orphan_tmp_files", lambda: None)
     monkeypatch.setattr(_d, "_gc_old_sessions", lambda: None)
     monkeypatch.setattr(_d, "_render_all_sessions", lambda: None)
-
-    import claude_statusbar.core as core
-    monkeypatch.setattr(core, "check_for_updates", lambda: None)
 
     slept = []
 

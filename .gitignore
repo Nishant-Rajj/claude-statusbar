@@ -52,3 +52,4 @@ setup_*.py
 
 # CodeGraph local index (MCP server)
 .codegraph/
+scripts/
