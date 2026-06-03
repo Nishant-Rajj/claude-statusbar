@@ -49,3 +49,4 @@ setup_*.py
 
 # Agent runtime state
 .omx/
+scripts/

@@ -730,30 +730,13 @@ def test_render_payload_captures_stdout(monkeypatch):
     )
 
 
-def test_suppress_side_effects_skips_update_check(monkeypatch, tmp_path: Path):
-    """_suppress_side_effects=True must skip both check_for_updates and
-    _maybe_ensure_statusline (the daemon path runs them on its own cadence)."""
+def test_auto_update_removed_from_core():
+    """check_for_updates and _maybe_ensure_statusline must not exist in core —
+    they were removed as a security patch (no silent PyPI upgrades)."""
     import claude_statusbar.core as core_mod
-    update_calls = []
-    statusline_calls = []
-    monkeypatch.setattr(core_mod, "check_for_updates",
-                        lambda *a, **kw: update_calls.append(True))
-    monkeypatch.setattr(core_mod, "_maybe_ensure_statusline",
-                        lambda *a, **kw: statusline_calls.append(True))
-
-    # Pipe a minimal stdin payload.
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
-    try:
-        core_mod.main(_suppress_side_effects=True)
-    except Exception:
-        # The render path may fail because we mocked things — that's OK.
-        # We're only checking the side-effect guard here.
-        pass
-    assert update_calls == [], "_suppress_side_effects must skip check_for_updates"
-    assert statusline_calls == [], (
-        "_suppress_side_effects must skip _maybe_ensure_statusline"
+    assert not hasattr(core_mod, "check_for_updates"), (
+        "check_for_updates was re-introduced in core — security patch broken"
     )
-
-
-# Helper imports for the side-effects test
-import io  # noqa: E402
+    assert not hasattr(core_mod, "_maybe_ensure_statusline"), (
+        "_maybe_ensure_statusline was re-introduced in core — security patch broken"
+    )

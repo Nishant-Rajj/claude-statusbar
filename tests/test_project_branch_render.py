@@ -48,13 +48,25 @@ def test_detached_head_uses_short_sha():
 
 
 def test_worktree_suffix():
+    # A worktree shows a bare boolean marker — no redundant name, since the
+    # branch already identifies which worktree it is.
     s = render_identity_line(
         IdentityInfo(project_name="proj", in_git=True, branch="feat-x",
-                     detached=False, worktree_name="feat-x", toplevel="/x"),
+                     detached=False, worktree_name="feat-x", toplevel="/x",
+                     is_worktree=True),
         theme=THEME, dirty=False, use_color=False,
     )
-    assert "feat-x" in s
-    assert "worktree" in s.lower()
+    assert "[worktree]" in s
+
+
+def test_no_worktree_marker_for_normal_checkout():
+    s = render_identity_line(
+        IdentityInfo(project_name="proj", in_git=True, branch="main",
+                     detached=False, worktree_name=None, toplevel="/x",
+                     is_worktree=False),
+        theme=THEME, dirty=False, use_color=False,
+    )
+    assert "worktree" not in s.lower()
 
 
 def test_color_mode_emits_ansi():
@@ -94,6 +106,49 @@ def test_dispatcher_omits_identity_when_disabled():
         show_project_branch=False,
     )
     assert "\n" not in out
+
+
+def test_identity_line_shows_duration_and_lines():
+    s = render_identity_line(
+        IdentityInfo(project_name="proj", in_git=True, branch="main",
+                     detached=False, worktree_name=None, toplevel="/x"),
+        theme=THEME, dirty=False, duration_text="1h12m", lines_text="+235",
+        use_color=False,
+    )
+    assert "proj" in s and "main" in s
+    assert "⏱" in s and "1h12m" in s
+    assert "+235" in s
+
+
+def test_identity_line_lines_diff_colored():
+    s = render_identity_line(
+        IdentityInfo(project_name="p", in_git=True, branch="main",
+                     detached=False, worktree_name=None, toplevel="/x"),
+        theme=THEME, dirty=False, lines_text="+41 -15", use_color=True,
+    )
+    from claude_statusbar.styles import _fg
+    assert _fg(THEME.s_ok) in s    # +41 green
+    assert _fg(THEME.s_hot) in s   # -15 red
+
+
+def test_identity_line_lines_before_duration():
+    # Lines (productivity) read first; the weaker duration signal trails it.
+    s = render_identity_line(
+        IdentityInfo(project_name="p", in_git=True, branch="main",
+                     detached=False, worktree_name=None, toplevel="/x"),
+        theme=THEME, dirty=False, duration_text="1h12m", lines_text="+235",
+        use_color=False,
+    )
+    assert s.index("+235") < s.index("1h12m")
+
+
+def test_identity_line_no_stats_when_absent():
+    s = render_identity_line(
+        IdentityInfo(project_name="p", in_git=True, branch="main",
+                     detached=False, worktree_name=None, toplevel="/x"),
+        theme=THEME, dirty=False, use_color=False,
+    )
+    assert "⏱" not in s
 
 
 def test_dispatcher_applies_to_capsule_too():

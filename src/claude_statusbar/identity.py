@@ -73,6 +73,31 @@ class IdentityInfo:
     detached: bool
     worktree_name: Optional[str]
     toplevel: Optional[str]
+    is_worktree: bool = False
+
+
+def _detect_worktree(start: Path) -> bool:
+    """True when `start` sits inside a *linked* git worktree.
+
+    A linked worktree's `.git` is a FILE whose `gitdir:` points under the
+    main repo's `.git/worktrees/<name>/`. A submodule's `.git` file points
+    under `.git/modules/<name>/` instead — so the `worktrees` segment is
+    what distinguishes a worktree from both a normal checkout (`.git` is a
+    directory) and a submodule. Local + reliable; no dependency on Claude
+    Code passing `workspace_git_worktree`.
+    """
+    cur = start.resolve() if start.exists() else start
+    for candidate in [cur, *cur.parents]:
+        dotgit = candidate / ".git"
+        if dotgit.is_dir():
+            return False
+        if dotgit.is_file():
+            try:
+                text = dotgit.read_text(encoding="utf-8").strip()
+            except OSError:
+                return False
+            return "worktrees/" in text or "worktrees\\" in text
+    return False
 
 
 def _resolve_toplevel(start: Path) -> Optional[Path]:
@@ -109,6 +134,9 @@ def resolve_identity(stdin: dict) -> IdentityInfo:
     start = Path(current_dir or project_dir or os.getcwd())
     head = read_head(start)
     toplevel = _resolve_toplevel(start) if head else None
+    # Trust the local filesystem first (works even when CC omits the field),
+    # fall back to the stdin hint for the rare case the cwd isn't on disk.
+    is_worktree = (_detect_worktree(start) if head else False) or bool(worktree_name)
 
     return IdentityInfo(
         project_name=project_name,
@@ -117,6 +145,7 @@ def resolve_identity(stdin: dict) -> IdentityInfo:
         detached=head[1] if head else False,
         worktree_name=worktree_name,
         toplevel=str(toplevel) if toplevel else None,
+        is_worktree=is_worktree,
     )
 
 
@@ -151,3 +180,18 @@ def dirty_with_async_refresh(toplevel: str) -> Optional[bool]:
             git_cache.clear_inflight(toplevel)
 
     return None if entry is None else bool(entry.get("dirty"))
+
+
+def read_ahead_behind(toplevel: str) -> Tuple[Optional[int], Optional[int]]:
+    """Return (ahead, behind) from the git cache without triggering a refresh.
+
+    The refresh is already kicked off by ``dirty_with_async_refresh`` (both
+    values come from the same ``git status --branch`` call), so this is a
+    cheap cache read. (None, None) when unknown / no upstream / cache miss.
+    """
+    from . import git_cache
+
+    entry = git_cache.read_cache(toplevel)
+    if entry is None:
+        return None, None
+    return entry.get("ahead"), entry.get("behind")
