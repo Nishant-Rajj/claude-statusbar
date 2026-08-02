@@ -67,6 +67,20 @@ def test_pct_preserves_over_100(monkeypatch, isolated_cache):
     assert out["rate_limit_pct"] == 110
 
 
+def test_pct_rejects_leaked_epoch(monkeypatch, isolated_cache):
+    """Known upstream leak: used_percentage can carry the reset epoch (~1.78e9).
+    An implausibly large magnitude must be rejected, not rendered as a MAX bar."""
+    _stdin_with({
+        "rate_limits": {
+            "five_hour": {"used_percentage": 1782630000, "resets_at": 9999999999},
+            "seven_day": {"used_percentage": 1783209600, "resets_at": 9999999999},
+        },
+    }, monkeypatch)
+    out = core.parse_stdin_data()
+    assert out["rate_limit_pct"] == 0
+    assert out["rate_limit_7d_pct"] == 0
+
+
 def test_pct_rounds_floating_point_drift(monkeypatch, isolated_cache):
     """Anthropic occasionally returns 56.00000000000001."""
     _stdin_with({
@@ -121,6 +135,37 @@ def test_has_stdin_unset_when_stdin_empty(monkeypatch, isolated_cache):
 
     out = core.parse_stdin_data()
     assert out.get("_has_stdin") is None
+
+
+def test_main_handles_null_context_used_pct_without_reset_fallback(
+    monkeypatch, isolated_cache, capsys
+):
+    """Claude can send context_window.used_percentage=null. Rendering must
+    treat that as unknown/0-ish context, not fall into claude-monitor fallback."""
+    _stdin_with({
+        "model": {"id": "claude-opus-4-1", "display_name": "Opus 4.1 (1M context)"},
+        "rate_limits": {
+            "five_hour": {"used_percentage": 12, "resets_at": 9999999999},
+            "seven_day": {"used_percentage": 34, "resets_at": 9999999999},
+        },
+        "context_window": {
+            "used_percentage": None,
+            "context_window_size": 1_000_000,
+            "total_input_tokens": 1234,
+            "total_output_tokens": 56,
+        },
+    }, monkeypatch)
+
+    def fail_reset(*_args, **_kwargs):
+        pytest.fail("null context_used_pct should not call calculate_reset_time fallback")
+
+    monkeypatch.setattr(core, "calculate_reset_time", fail_reset)
+    import claude_statusbar.styles as styles_mod
+    monkeypatch.setattr(styles_mod, "render", lambda *_args, **_kwargs: "OK")
+
+    core.main(_suppress_side_effects=True)
+
+    assert capsys.readouterr().out.strip() == "OK"
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,74 @@ def _safe(thunk):
         return f"<error: {type(e).__name__}: {e}>"
 
 
+def _render_argv() -> list:
+    """The argv Claude Code's statusLine effectively runs.
+
+    Frozen binaries dispatch subcommands directly (`sys.executable` *is* `cs`);
+    pip/uv installs go through `-m`, matching the self-spawn convention in
+    daemon.py and cli.py.
+    """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "render"]
+    return [sys.executable, "-m", "claude_statusbar.cli", "render"]
+
+
+def _render_smoke_test(cache: Path) -> None:
+    """Actually render, using the real cached payload, and report if it dies.
+
+    Every other check here inspects *state* — all of them can be green while the
+    render path itself is broken. That is exactly what happened in issue #36: the
+    standalone binary raised ValueError on every tick once a session was cached,
+    the status line vanished in Claude Code, and `cs doctor` still reported all
+    green because it never rendered anything.
+
+    The empty-stdin render some earlier checks imply is not enough either — the
+    crash only surfaced with a realistic payload, because the cached meta needs a
+    `daemon_started_at` field to reach the code-drift check. So feed the genuine
+    `last_stdin.json` through a real subprocess.
+
+    Side effect: this is a normal status-line tick, so it refreshes the session
+    bucket and may lazily spawn the daemon, exactly as Claude Code's own ticks do.
+    """
+    import subprocess
+
+    if not cache.exists():
+        _line("render smoke test", _dim("skipped — no cached payload yet"))
+        return
+    try:
+        payload = cache.read_bytes()
+    except OSError as e:
+        _line("render smoke test", _dim(f"skipped — cache unreadable: {e}"))
+        return
+
+    try:
+        proc = subprocess.run(_render_argv(), input=payload,
+                              capture_output=True, timeout=30)
+    except Exception as e:
+        _line("render smoke test",
+              _red(f"could not run: {type(e).__name__}: {e}"), ok=False)
+        return
+
+    stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        tail = stderr.splitlines()[-1] if stderr else f"exit {proc.returncode}"
+        _line("render smoke test", _red(f"CRASHED — {tail}"), ok=False)
+        for ln in stderr.splitlines()[-15:]:
+            print(f"      {_dim(ln)}")
+        print(f"      {_dim('please paste this into an issue: ' + _ISSUES_URL)}")
+        return
+
+    out = (proc.stdout or b"").decode("utf-8", "replace")
+    if not out.strip():
+        _line("render smoke test",
+              _red("rendered nothing — status line would be blank"), ok=False)
+        return
+    _line("render smoke test", f"ok — {len(out)} bytes rendered")
+
+
+_ISSUES_URL = "https://github.com/leeguooooo/claude-code-usage-bar/issues"
+
+
 def run() -> int:
     print()
     print("  cs doctor — claude-statusbar self-check")
@@ -130,6 +198,30 @@ def run() -> int:
         _line("last_stdin cache",
               _dim("not yet — Claude Code hasn't pushed any payload"))
 
+    # --- 5h/7d quota cache freshness ---
+    # The single most-reported "my bars disappeared" cause: the statusLine got
+    # displaced (or the daemon died), cs stopped receiving rate_limits, and the
+    # cached windows expired — so the expiry guard hid the bars. Surface it here
+    # with the fix instead of making users diff cache files by hand.
+    try:
+        from .predict import quota_cache_status
+        _qs, _qage = quota_cache_status()
+        if _qs == "stale":
+            age_txt = f"{int(_qage/3600)}h" if _qage and _qage >= 3600 else (
+                f"{int(_qage/60)}m" if _qage else "?")
+            _line("5h/7d quota cache",
+                  _red(f"stale (last update {age_txt} ago, resets expired) — "
+                       f"restart Claude Code to refresh; if it keeps happening "
+                       f"another tool took the statusLine → run cs --setup"),
+                  ok=False)
+        elif _qs == "fresh":
+            _line("5h/7d quota cache", "fresh")
+        else:
+            _line("5h/7d quota cache",
+                  _dim("empty — no quota recorded yet (new account / relay)"))
+    except Exception:
+        pass
+
     # --- daemon (Phase B+) ---
     try:
         from . import daemon as _d
@@ -173,6 +265,14 @@ def run() -> int:
     except Exception as e:
         _line("service", _dim(f"check skipped: {e}"))
 
+    # --- render smoke test ---
+    # Last of the health checks, and the only one that proves the render path
+    # actually works rather than merely inspecting state around it.
+    try:
+        _render_smoke_test(cache)
+    except Exception as e:  # doctor must never die on its own check
+        _line("render smoke test", _dim(f"check skipped: {e}"))
+
     # --- terminal ---
     try:
         size = os.get_terminal_size()
@@ -188,6 +288,8 @@ def run() -> int:
         _line("theme", cfg.theme)
         _line("density", cfg.density)
         _line("show_cost", cfg.show_cost)
+        _line("show_balance", cfg.show_balance)
+        _line("balance_bar", cfg.balance_bar)
         _line("show_weekly", cfg.show_weekly)
         _line("show_language", cfg.show_language)
         if cfg.auto_compact_width:

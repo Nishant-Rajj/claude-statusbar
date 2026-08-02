@@ -282,3 +282,80 @@ def test_language_logging_does_not_clobber_root(monkeypatch):
     level_after = root.level
     assert handlers_after == handlers_before, "core.py polluted root logger handlers"
     assert level_after == level_before, "core.py reset root logger level"
+
+
+# --- battery bar fill gradient: same hue, bright left anchor → darker tip ---
+
+def test_battery_bar_fill_gradient_left_anchors_severity_color():
+    # The fill is a SAME-HUE gradient anchored at the LEFT: the first cell is
+    # the exact severity colour (identity anchor — always visible), fading
+    # darker toward the progress tip by scaling toward black (hue preserved),
+    # NEVER by blending toward the grey bar background — a grey-blended dark
+    # end reads as "empty" and muddies the hue (live feedback 2026-06-12:
+    # "渐变反了 / 配色不好看").
+    import re
+    from claude_statusbar.progress import build_battery_bar
+    from claude_statusbar.themes import get_theme
+    theme = get_theme("graphite")
+    bar = build_battery_bar(66.0, use_color=True, theme=theme,
+                            warning_threshold=30, critical_threshold=70)
+    bgs = [tuple(map(int, m)) for m in re.findall(r"48;2;(\d+);(\d+);(\d+)", bar)]
+    filled = bgs[:7]                      # 66% of width 10 → 7 filled cells
+    assert filled[0] == tuple(theme.s_warn)    # left end = exact severity colour
+    assert filled[-1] != filled[0]             # tip visibly darker
+    sums = [sum(c) for c in filled]
+    assert sums == sorted(sums, reverse=True)  # monotonic bright → dark
+    # Hue survives the fade: the tip keeps clear channel spread (still "red",
+    # not the grey of the empty cells).
+    tip = filled[-1]
+    assert max(tip) - min(tip) >= 40
+    assert bgs[7] == tuple(theme.edge)         # empty cells untouched
+
+
+def test_battery_bar_single_filled_cell_keeps_pure_severity_color():
+    import re
+    from claude_statusbar.progress import build_battery_bar
+    from claude_statusbar.themes import get_theme
+    theme = get_theme("graphite")
+    bar = build_battery_bar(5.0, use_color=True, theme=theme,
+                            warning_threshold=30, critical_threshold=70)
+    bgs = [tuple(map(int, m)) for m in re.findall(r"48;2;(\d+);(\d+);(\d+)", bar)]
+    assert bgs[0] == tuple(theme.s_ok)         # lone cell = pure colour, no sink
+
+
+# ---------------------------------------------------------------------------
+# Context % must color the model name with the context band (70/85), not the
+# 5h/7d comfort band (30/70). Regression: a session at ~35% context used to
+# paint the model name yellow in quota mode while the no-quota ctx bar read
+# green for the identical 35%.
+# ---------------------------------------------------------------------------
+from claude_statusbar.progress import _fg as _fg_code
+
+
+def _quota_line(ctx_pct):
+    # Low 5h/7d so the only severity that can appear comes from ctx → model.
+    return format_status_line(
+        10, 10, "1h", "Opus",
+        weekly_pct=5, ctx_pct=ctx_pct,
+        use_color=True, theme=_TH,
+    )
+
+
+def test_ctx_model_color_calm_below_context_warning():
+    # 35% context is well under the 70 context-warning → no yellow anywhere.
+    out = _quota_line(35)
+    assert _fg_code(_TH.s_warn) not in out
+    assert _fg_code(_TH.s_hot) not in out
+    assert _fg_code(_TH.s_ok) in out
+
+
+def test_ctx_model_color_warns_at_context_band():
+    # 75% context is in the 70–85 context-warning band → model yellow.
+    out = _quota_line(75)
+    assert _fg_code(_TH.s_warn) in out
+
+
+def test_ctx_model_color_critical_above_context_critical():
+    # 90% context is above the 85 context-critical → model red.
+    out = _quota_line(90)
+    assert _fg_code(_TH.s_hot) in out

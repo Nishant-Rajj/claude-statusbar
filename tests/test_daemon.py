@@ -97,6 +97,28 @@ def test_active_sessions_lists_recent_buckets(monkeypatch, tmp_path: Path):
     assert "stale-sid" not in sids
 
 
+def test_active_sessions_skips_idle_buckets_before_gc(monkeypatch, tmp_path: Path):
+    """A Claude window that stopped ticking must not stay in the daemon's
+    1Hz render set until the 24h GC window expires."""
+    monkeypatch.setattr(_d, "_cache_dir", lambda: tmp_path)
+    sroot = tmp_path / "sessions"
+    sroot.mkdir(parents=True)
+    active = sroot / "active-sid"
+    active.mkdir()
+    (active / "last_stdin.json").write_text("{}", encoding="utf-8")
+    idle = sroot / "idle-sid"
+    idle.mkdir()
+    p = idle / "last_stdin.json"
+    p.write_text("{}", encoding="utf-8")
+    old = time.time() - (_d.ACTIVE_SESSION_AFTER_S + 1)
+    os.utime(p, (old, old))
+
+    sids = _d._active_sessions()
+
+    assert "active-sid" in sids
+    assert "idle-sid" not in sids
+
+
 def test_session_dir_sanitises_session_id(monkeypatch, tmp_path: Path):
     """Defensive: a malicious session_id with path traversal must not
     escape sessions/ directory."""
@@ -119,6 +141,62 @@ def test_thin_client_stale_meta():
     assert render_thin._is_fresh(
         {"generated_at": now - 30.0, "stale_after_seconds": 5.0}
     ) is False
+
+
+def test_thin_client_does_not_signal_daemon_for_age_stale_meta(monkeypatch, tmp_path: Path):
+    """A slow session render can make one bucket older than stale_after.
+    That should fall back and spawn-if-dead, not kill the shared daemon."""
+    _setup_session_paths(monkeypatch, tmp_path)
+    sdir = tmp_path / "sessions" / "default"
+    sdir.mkdir(parents=True)
+    (sdir / "rendered.ansi").write_text("old\n", encoding="utf-8")
+    (sdir / "rendered.meta.json").write_text(json.dumps({
+        "generated_at": time.time() - 30.0,
+        "stale_after_seconds": 5.0,
+        "daemon_started_at": time.time(),
+        "pid": 12345,
+    }), encoding="utf-8")
+
+    signalled = []
+    monkeypatch.setattr(render_thin, "_signal_outdated_daemon", lambda meta: signalled.append(meta))
+    monkeypatch.setattr(render_thin, "_spawn_daemon_async", lambda: None)
+    monkeypatch.setattr(render_thin, "_fallback_inline", lambda: 0)
+
+    assert render_thin.render() == 0
+    assert signalled == []
+
+
+def test_thin_client_drift_tick_does_not_burn_spawn_debounce(monkeypatch, tmp_path: Path):
+    """The drift tick SIGTERMs the outdated daemon but must NOT attempt a spawn.
+
+    The old daemon is still alive while it handles the signal, so `spawn_if_dead`
+    would find a valid pidfile and refuse — after `_spawn_daemon_async` had
+    already stamped the 30s debounce marker. That stranded every session on the
+    slow inline path for 30s after each upgrade. Leave the debounce untouched so
+    the next tick (~1s later) spawns the fresh daemon.
+    """
+    _setup_session_paths(monkeypatch, tmp_path)
+    sdir = tmp_path / "sessions" / "default"
+    sdir.mkdir(parents=True)
+    (sdir / "rendered.ansi").write_text("old\n", encoding="utf-8")
+    (sdir / "rendered.meta.json").write_text(json.dumps({
+        "generated_at": time.time(),
+        "stale_after_seconds": 5.0,
+        "daemon_started_at": time.time() - 3600,  # booted before the upgrade
+        "pid": 12345,
+    }), encoding="utf-8")
+    monkeypatch.setattr(render_thin, "_pkg_mtime", lambda: time.time())
+
+    signalled, spawned = [], []
+    monkeypatch.setattr(render_thin, "_signal_outdated_daemon",
+                        lambda meta: signalled.append(meta["pid"]))
+    monkeypatch.setattr(render_thin, "_spawn_daemon_async",
+                        lambda: spawned.append(True))
+    monkeypatch.setattr(render_thin, "_fallback_inline", lambda: 0)
+
+    assert render_thin.render() == 0
+    assert signalled == [12345], "outdated daemon must be told to exit"
+    assert spawned == [], "must not spawn while the outdated daemon is still alive"
 
 
 def test_thin_client_handles_missing_fields():
@@ -295,12 +373,18 @@ def test_thin_client_forwards_stdin_to_per_session_cache(monkeypatch, tmp_path: 
     render_thin.render()
 
     # Both must have their own bucket; B did NOT overwrite A's stdin.
+    # render_thin stamps `_cs_env` into the payload, so compare content minus it.
+    def _without_env(b: bytes) -> dict:
+        d = json.loads(b)
+        d.pop("_cs_env", None)
+        return d
+
     a_stdin = tmp_path / "sessions" / sid_a / "last_stdin.json"
     b_stdin = tmp_path / "sessions" / sid_b / "last_stdin.json"
-    assert a_stdin.read_bytes() == payload_a, (
+    assert _without_env(a_stdin.read_bytes()) == json.loads(payload_a), (
         "session A's stdin was overwritten — multi-session race not fixed"
     )
-    assert b_stdin.read_bytes() == payload_b
+    assert _without_env(b_stdin.read_bytes()) == json.loads(payload_b)
 
 
 def test_thin_client_fallback_when_meta_stale(monkeypatch, tmp_path: Path):
@@ -478,8 +562,10 @@ def test_thin_client_routes_missing_session_id_to_default_bucket(
     assert out == "DEFAULT BUCKET LINE\n", out
 
     # And the stdin must have been persisted into sessions/default/.
-    persisted = (default_dir / "last_stdin.json").read_bytes()
-    assert persisted == payload
+    # render_thin stamps `_cs_env`; compare content minus it.
+    persisted = json.loads((default_dir / "last_stdin.json").read_bytes())
+    persisted.pop("_cs_env", None)
+    assert persisted == json.loads(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -615,7 +701,10 @@ def test_running_global_is_reset_per_run_forever_call(monkeypatch, tmp_path: Pat
     # actually entering the sleep loop. We're only checking the reset.
     monkeypatch.setattr(_d, "_acquire_pidfile", lambda: False)
     rc = _d.run_forever(render_interval=0.01)
-    assert rc == 1  # acquire failed
+    # 0, not 1: another daemon already holds the pidfile, so this process has
+    # nothing to do and says so cleanly. See
+    # test_run_forever_exits_clean_when_a_daemon_already_runs.
+    assert rc == 0
     assert _d._running is True, (
         "run_forever() must reset _running=True at entry; otherwise the next "
         "in-process daemon start exits before doing any work"
@@ -689,6 +778,13 @@ def test_render_payload_signal_alarm_aborts_slow_render(monkeypatch):
     import claude_statusbar.core as core_mod
     import time as _time
 
+    # `_log` writes to the real ~/.cache/claude-statusbar/daemon.log. Without
+    # this, the timeout below appends `render timed out after 1s` to the user's
+    # production log on every test run — 260 such lines had accumulated there,
+    # indistinguishable from (and drowning out) the daemon's genuine 12s
+    # timeouts, which last fired over a month earlier.
+    monkeypatch.setattr(_d, "_log", lambda *a, **k: None)
+
     # Shorten timeout so the test runs in ~1s.
     monkeypatch.setattr(_d, "RENDER_TIMEOUT_S", 1)
 
@@ -740,3 +836,301 @@ def test_auto_update_removed_from_core():
     assert not hasattr(core_mod, "_maybe_ensure_statusline"), (
         "_maybe_ensure_statusline was re-introduced in core — security patch broken"
     )
+
+
+# Helper imports for the side-effects test
+import io  # noqa: E402
+
+
+def test_gc_orphan_tmp_files(tmp_path, monkeypatch):
+    import time
+    import claude_statusbar.daemon as daemon
+    monkeypatch.setattr(daemon, "_cache_dir", lambda: tmp_path)
+    old = tmp_path / ".last_stdin.json.abc123.tmp"
+    old.write_text("")
+    import os
+    os.utime(old, (time.time() - 7200, time.time() - 7200))
+    fresh = tmp_path / ".last_stdin.json.def456.tmp"
+    fresh.write_text("")
+    keeper = tmp_path / "rate_latest.json"          # non-tmp: untouched
+    keeper.write_text("{}")
+    daemon._gc_orphan_tmp_files()
+    assert not old.exists()
+    assert fresh.exists()                            # younger than 1h: kept
+    assert keeper.exists()
+
+
+def test_daemon_has_no_ip_heartbeat():
+    """The daemon must not import or reference the egress-IP prober module at
+    all — removed as a security patch (see .security/patches.md Patch 7)."""
+    import inspect
+    import claude_statusbar.daemon as daemon
+    src = inspect.getsource(daemon.run_forever)
+    needle = "ip_r" + "isk"
+    assert needle not in src, "run_forever must not reference the ip-risk prober"
+
+
+def test_maintenance_runs_on_the_first_tick(monkeypatch, tmp_path: Path):
+    """Orphan-tmp GC must fire on the daemon's first tick.
+
+    It used to share the session-GC timer, which is seeded to `now` and only
+    fires after 30 minutes. But the thin client SIGTERMs this daemon whenever it
+    spots code drift, so it seldom lives that long — the tmp sweep was starved
+    and effectively never ran. Observed live: 15 orphaned .tmp files, oldest 99
+    min, against a 60-minute cutoff.
+
+    The auto-update check that used to share this timer was removed as a
+    security patch (no silent PyPI upgrades) — see test_auto_update_removed_from_core.
+    """
+    monkeypatch.setattr(_d, "_acquire_pidfile", lambda: True)
+    monkeypatch.setattr(_d, "_release_pidfile", lambda: None, raising=False)
+    monkeypatch.setattr(_d, "_log", lambda *a, **k: None)
+    monkeypatch.setattr(_d.signal, "signal", lambda *a, **k: None)
+
+    calls = []
+    monkeypatch.setattr(_d, "_gc_orphan_tmp_files", lambda: calls.append("tmp_gc"))
+    monkeypatch.setattr(_d, "_gc_old_sessions", lambda: calls.append("session_gc"))
+
+    # Render once, then break out of the loop.
+    def _one_tick():
+        _d._running = False
+    monkeypatch.setattr(_d, "_render_all_sessions", _one_tick)
+
+    _d.run_forever(render_interval=0.0)
+
+    assert "tmp_gc" in calls, "orphan-tmp GC must not wait 30 minutes"
+    # Session GC keeps its deferral — it can race a mid-restart Claude Code window.
+    assert "session_gc" not in calls
+
+
+def test_clock_advancing_between_guard_and_sleep_does_not_crash(monkeypatch):
+    """The sleep remainder must be clamped at 0.
+
+    `while _running and time.time() < end` and `min(0.2, end - time.time())`
+    read the clock separately. When the process is descheduled between the two
+    reads, the guard passes on a remainder that is already spent by the time
+    `min()` subtracts — so `time.sleep()` received a negative value and raised
+    `ValueError: sleep length must be non-negative`, killing the daemon. That is
+    why it never survived the 30 minutes its GC and update check waited for.
+
+    A fake clock steps past `end` exactly once, between the two reads: the real
+    race, made deterministic.
+    """
+    monkeypatch.setattr(_d, "_acquire_pidfile", lambda: True)
+    monkeypatch.setattr(_d, "_release_pidfile", lambda: None, raising=False)
+    monkeypatch.setattr(_d, "_log", lambda *a, **k: None)
+    monkeypatch.setattr(_d.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(_d, "_gc_orphan_tmp_files", lambda: None)
+    monkeypatch.setattr(_d, "_gc_old_sessions", lambda: None)
+    monkeypatch.setattr(_d, "_render_all_sessions", lambda: None)
+
+    slept = []
+
+    class _Clock:
+        # Reads settle at 100.0 through `end = 100.0 + 0.5`. The loop guard then
+        # reads 100.4 (< end, passes); the very next read — inside min() — is
+        # 100.6, leaving a remainder of -0.1.
+        _seq = [100.0, 100.0, 100.0, 100.0, 100.0, 100.4, 100.6]
+
+        def __init__(self):
+            self.i = 0
+
+        def time(self):
+            v = self._seq[min(self.i, len(self._seq) - 1)]
+            self.i += 1
+            return v
+
+        def sleep(self, n):
+            slept.append(n)
+            if n < 0:
+                raise ValueError("sleep length must be non-negative")
+            _d._running = False  # one pass through the sleep loop is enough
+
+    monkeypatch.setattr(_d, "time", _Clock())
+
+    assert _d.run_forever(render_interval=0.5) == 0
+    assert slept, "the sleep loop never ran — the fake clock never entered it"
+    assert all(n >= 0 for n in slept), f"negative sleep passed to time.sleep: {slept}"
+
+
+def test_run_forever_exits_clean_when_a_daemon_already_runs(monkeypatch, capsys):
+    """A live daemon means this process's job is already done — exit 0.
+
+    Exit 1 told launchd's `KeepAlive` the job had failed, so it relaunched every
+    ThrottleInterval for as long as the lazy-spawned daemon held the pidfile.
+    """
+    monkeypatch.setattr(_d, "_acquire_pidfile", lambda: False)
+    monkeypatch.setattr(_d, "read_pidfile", lambda: 4242)
+    monkeypatch.setattr(_d, "_release_pidfile", lambda: None, raising=False)
+
+    assert _d.run_forever() == 0
+    assert "already running (pid 4242)" in capsys.readouterr().err
+
+
+def test_cmdline_matcher_recognizes_every_spawn_shape():
+    """`cs daemon stop` and the drift-kill guard identify the daemon by its
+    process cmdline. Matching only the `claude_statusbar` module path missed
+    launchd/systemd instances, which run via the `cs` console script — those
+    daemons became unkillable (stop refused, drift-kill refused) and never
+    picked up upgrades."""
+    # lazy-spawn / cmd_start
+    assert _d._cmdline_is_our_daemon(
+        "/usr/bin/python3 -m claude_statusbar.cli daemon _run --render-interval 1.0")
+    # launchd / systemd: venv python + cs console script — no underscore form
+    assert _d._cmdline_is_our_daemon(
+        "/Users/leo/.local/share/uv/tools/claude-statusbar/bin/python3 "
+        "/Users/leo/.local/bin/cs daemon _run")
+    # plain pip install: system python + /usr/local/bin/cs
+    assert _d._cmdline_is_our_daemon("/usr/bin/python3 /usr/local/bin/cs daemon _run")
+    # NUL-separated /proc form, post-normalization
+    assert _d._cmdline_is_our_daemon("python3 /usr/local/bin/cs daemon _run ")
+    # unrelated processes must not match
+    assert not _d._cmdline_is_our_daemon("vim daemon_notes.md")
+    assert not _d._cmdline_is_our_daemon("/usr/sbin/securityd")
+    assert not _d._cmdline_is_our_daemon("python3 somethingelse.py --daemon")
+
+
+def test_release_pidfile_leaves_someone_elses_file_alone(monkeypatch, tmp_path: Path):
+    """flock locks an inode, not a path: after unlink+recreate, two daemons
+    each hold a lock on different inodes. The exiting one must not delete the
+    pidfile the current owner wrote — that made the survivor invisible to
+    stop/status/spawn_if_dead, so every render spawned another duplicate."""
+    monkeypatch.setattr(_d, "_cache_dir", lambda: tmp_path)
+
+    # Daemon A acquires; its handle points at inode 1.
+    assert _d._acquire_pidfile() is True
+    handle_a = _d._pidfile_handle
+
+    # The pidfile is unlinked and recreated by daemon B (new inode, new owner).
+    _d.pid_path().unlink()
+    _d.pid_path().write_text("99999", encoding="utf-8")
+
+    # Daemon A exits: must NOT delete B's file.
+    _d._pidfile_handle = handle_a
+    _d._release_pidfile()
+    assert _d.pid_path().exists(), "exiting daemon deleted the new owner's pidfile"
+    assert _d.pid_path().read_text() == "99999"
+
+
+def test_release_pidfile_still_cleans_its_own_file(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(_d, "_cache_dir", lambda: tmp_path)
+    assert _d._acquire_pidfile() is True
+    _d._release_pidfile()
+    assert not _d.pid_path().exists()
+
+
+def test_windows_identity_uses_cim_not_ps(monkeypatch):
+    """On Windows there is no /proc, and a Git-Bash `ps` on PATH only lists
+    MSYS processes — a natively spawned daemon reads as gone, so `cs daemon
+    stop` refuses to stop it and the drift-kill guard never restarts it onto
+    upgraded code."""
+    import subprocess as _sp
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd[0])
+        if cmd[0] == "ps":
+            raise AssertionError("ps must not be consulted on win32")
+        return _sp.CompletedProcess(
+            cmd, 0,
+            stdout=(r'"C:\Python\python.exe" -m claude_statusbar.cli '
+                    'daemon _run --render-interval 1.0\n'),
+            stderr="",
+        )
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    assert _d._process_is_our_daemon(4242) is True
+    assert calls and calls[0] in ("powershell", "pwsh")
+
+
+def test_windows_identity_false_when_pid_is_someone_else(monkeypatch):
+    import subprocess as _sp
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        _sp, "run",
+        lambda cmd, **kw: _sp.CompletedProcess(
+            cmd, 0, stdout="C:\\Windows\\explorer.exe\n", stderr=""),
+    )
+
+    assert _d._process_is_our_daemon(4242) is False
+
+
+def test_windows_identity_false_when_no_shell_available(monkeypatch):
+    """No powershell and no pwsh — stay conservative, never SIGTERM."""
+    import subprocess as _sp
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        _sp, "run",
+        lambda cmd, **kw: (_ for _ in ()).throw(FileNotFoundError(cmd[0])),
+    )
+
+    assert _d._process_is_our_daemon(4242) is False
+
+
+MODULE_STATUSLINE = "C:/Users/x/miniconda3/python.exe -m claude_statusbar.cli render"
+
+
+def test_module_invocation_counts_as_ours():
+    """`<python> -m claude_statusbar.cli render` skips pip's console-script
+    launcher, which on Windows spawns a second process and roughly doubles
+    per-render latency. It must not be mistaken for a foreign tool."""
+    assert _is_our_statusline({"type": "command", "command": MODULE_STATUSLINE}) is True
+
+    from claude_statusbar.setup import _existing_uses_render
+    assert _existing_uses_render({"command": MODULE_STATUSLINE}) is True
+
+
+def test_daily_repair_does_not_rewrite_module_invocation(monkeypatch, tmp_path):
+    """The once-a-day auto-repair pass would otherwise replace a deliberate
+    module invocation with the console script every single day."""
+    from claude_statusbar import setup as _setup
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "statusLine": {"type": "command", "command": MODULE_STATUSLINE,
+                       "refreshInterval": 1},
+    }), encoding="utf-8")
+    monkeypatch.setattr(_setup, "SETTINGS_PATH", settings)
+
+    changed, msg = _setup.ensure_statusline_configured()
+
+    assert changed is False, msg
+    after = json.loads(settings.read_text(encoding="utf-8"))
+    assert after["statusLine"]["command"] == MODULE_STATUSLINE
+
+
+def test_displacement_warning_silent_for_module_invocation(monkeypatch, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "statusLine": {"type": "command", "command": MODULE_STATUSLINE},
+    }), encoding="utf-8")
+    monkeypatch.setattr(render_thin, "_USER_SETTINGS", settings)
+
+    assert render_thin._displacement_suffix() == ""
+
+
+def test_displacement_warning_silent_for_windows_exe_shim(monkeypatch, tmp_path):
+    """pip writes `cs.EXE` on Windows; case + extension must not read as foreign."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "statusLine": {"type": "command",
+                       "command": r"C:\Users\x\Scripts\cs.EXE render"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(render_thin, "_USER_SETTINGS", settings)
+
+    assert render_thin._displacement_suffix() == ""
+
+
+def test_displacement_warning_still_fires_for_foreign_tool(monkeypatch, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "statusLine": {"type": "command", "command": "starship prompt"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(render_thin, "_USER_SETTINGS", settings)
+
+    assert "starship" in render_thin._displacement_suffix()

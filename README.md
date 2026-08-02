@@ -1,3 +1,5 @@
+<div align="center">
+
 # Claude Status Bar
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -89,8 +91,6 @@ cs preview         # render every style × theme using your real data
 Colors default to green / yellow / red at 30% and 70% — both configurable.
 
 ---
-
-## Styles & themes
 
 3 styles × 9 themes = 27 combinations. Try them all with `cs preview`.
 
@@ -332,10 +332,13 @@ This fork has the following changes from upstream relative to the original `leeg
 | `install.sh` / `web-install.sh` deleted | Removed curl-pipe-bash install scripts |
 | Git remote `origin` removed | Prevents accidental `git pull` from upstream |
 | All upstream URLs stripped from metadata | `pyproject.toml`, `plugin.json`, `FUNDING.yml` |
+| `_ip_risk_refresh.py` deleted, `ip_risk.py` neutered | Removes calls to `api.ipify.org` / `api.ipapi.is` — see Patch 7 |
 
-**Runtime network surface: zero.** The only outbound calls at runtime are to `pypi.org` — and those are now removed. The binary runs fully offline after install.
+**Third-party network surface: zero.** No calls to PyPI, GitHub, or IP-intelligence services, regardless of config. The one remaining outbound call (`show_balance`) only contacts the relay endpoint *you've already configured* via `ANTHROPIC_BASE_URL`, using your own key — not a new third party, and only in no-quota/relay mode.
 
 **Install only from this local copy.** Never run `pip install claude-statusbar` — that fetches the upstream package which has auto-update enabled.
+
+Full patch-by-patch detail (what upstream does, what we do, how to verify, how to reapply): [`.security/patches.md`](.security/patches.md). Run `./scripts/verify-security.sh` after any upstream sync.
 
 ---
 

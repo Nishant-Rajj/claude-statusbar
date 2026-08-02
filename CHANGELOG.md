@@ -9,6 +9,968 @@ For a quick overview of the latest release, see the
 
 ---
 
+## v3.32.3 — 2026-07-27
+
+**Installer polish — three papercuts visible on every re-install.**
+
+- `install.sh` ended with `bash: line 1: tmp: unbound variable`. The cleanup trap referenced a variable declared `local` inside the download function, so by the time the `EXIT` trap fired it was out of scope — which under `set -u` errored *and* meant the downloaded tarball's temp dir was never cleaned up. The scratch dir is now a global with a proper cleanup trap.
+- `cs --setup reported an issue` was printed on every re-install even when everything succeeded. Setup lumped "this file exists with your edits, so we kept it" — a benign, expected outcome when re-running the installer — into the same bucket as genuine copy failures. Skipped and failed are now separate, and only real failures affect the exit code. The status was also computed inside an `if verbose:` block, so the same run returned 0 quietly and 1 verbosely; it no longer depends on verbosity.
+- `cs hud` printed its install/uninstall/stop messages and errors in Chinese inside an otherwise English installer — leftovers from the v3.31.0 HUD English-ification.
+
+---
+
+## v3.32.2 — 2026-07-27
+
+**Fixes a crash that broke the status line for every standalone-binary user ([#36](https://github.com/leeguooooo/claude-code-usage-bar/issues/36)).**
+
+Once the daemon had run at least once, `cs render` died on *every* tick with `ValueError: max() iterable argument is empty` — the bar flashed and vanished in Claude Code. `_pkg_mtime()` scanned the package dir for `.py` files to detect a daemon running stale code, but a PyInstaller onefile build has none (modules live in the PYZ archive), so `max()` got an empty iterable and raised `ValueError`, which the `except OSError` guard did not catch. Affected every binary release (v3.30.0–v3.32.1); pip/uv installs were never affected.
+
+Frozen builds now use the executable's own mtime, so the stale-daemon detection keeps working there — re-running `install.sh` replaces the binary, which is exactly the "installed code is newer than the daemon" signal it needs.
+
+**`cs doctor` now actually renders.** It reported all-green while the status line was dead, because every check inspected state and none exercised the render path. It now runs a real `cs render` with your cached payload and prints the traceback when it crashes — this class of bug can't hide behind a green report again.
+
+Thanks to [@gasbasd](https://github.com/gasbasd) for a report that pinpointed the root cause, the trigger condition, and the fix.
+
+---
+
+## v3.32.1 — 2026-07-22
+
+**Patch: `cs --version` program name + test determinism.** `cs --version` now derives its program name from `basename(argv[0])` rather than argparse's `%(prog)s` — Python 3.14 rewrites `%(prog)s` to `python3.x -m module` under `-m`, which mangled the prefix. The three aliases (`cs` / `cstatus` / `claude-statusbar`) now each show their real name on every Python version. Also made `test_preview` deterministic by forcing the demo dataset instead of depending on the machine's cached stdin (which can legitimately have no warm cache or cost).
+
+---
+
+## v3.32.0 — 2026-07-22
+
+**One command installs everything.** The `curl … install.sh | bash` one-liner now sets up *both* surfaces on macOS: the terminal statusLine **and** the floating desktop HUD. The macOS binary bundles the HUD (PyObjC) — no `pip install 'claude-statusbar[hud]'`, no venv, no extra steps. When the installer detects the Claude desktop app it registers the HUD to auto-start on login, and it rides the binary's own auto-update like everything else. Linux binaries are unchanged (the HUD is macOS-only).
+
+---
+
+## v3.31.0 — 2026-07-22
+
+**Desktop HUD: channel jump + English UI.** Single-click an AgentParty channel in the `cs hud` panel to open a menu — **Open session in Claude** (`claude://resume?session=` deep link to the matching CLI session), **Open in AgentParty** (`agentparty://channel/…` deep link the AgentParty client handles), or **Pin to bar** (keep that channel on the collapsed pill). The HUD UI is now fully English.
+
+---
+
+## v3.30.0 — 2026-07-22
+
+### Zero-dependency standalone binary — install with no Python or pip
+
+`claude-statusbar` now ships as a self-contained `cs` binary attached to each
+GitHub Release, so people without Python can install in one line:
+
+```
+curl -fsSL https://raw.githubusercontent.com/leeguooooo/claude-code-usage-bar/main/install.sh | bash
+```
+
+The installer detects the platform (macOS arm64/x86_64, Linux x86_64), verifies
+a SHA-256 checksum, drops the binary in `~/.local/bin`, and runs `cs --setup`.
+Platforms without a prebuilt binary fall back to the pip installer. The pip /
+uv / pipx package is still fully supported and remains required for the desktop
+HUD (`cs hud`), which needs PyObjC.
+
+Under the hood the frozen binary emulates `python -m <module>` for its own
+background self-spawns (daemon, git / balance / IP-risk refresh), so daemon
+fast-mode behaves identically to a pip install. The updater is frozen-aware: a
+binary can't `pip`-upgrade itself, so `cs upgrade` points at the installer
+instead, and the background auto-update check is skipped.
+
+### Documentation
+
+The README was reorganized into a concise landing page with a Features overview
+and per-topic guides under `docs/`, and a Simplified Chinese translation
+(`README.zh-CN.md`) was added.
+
+---
+
+## v3.29.12 — 2026-07-15
+
+### AgentParty sessions now read their complete matching status slot
+
+v3.29.11 made the displayed AgentParty identity session-specific, but the
+channel, unread count, last-message preview, and listener state still came
+from the workspace's shared last-writer mirror. Two sessions in the same
+repository could therefore render a mixed line, such as one session's agent
+name beside another session's channel or stale-listener warning.
+
+The status bar now reproduces AgentParty's config-slot fingerprint and reads
+the complete cache entry owned by the session's explicit
+`AGENTPARTY_CONFIG`. It falls back to the legacy workspace mirror when no
+matching slot exists, preserving compatibility with older AgentParty clients.
+
+---
+
+## v3.29.11 — 2026-07-11
+
+### AgentParty identity is isolated per session, not per project directory
+
+Two Claude Code sessions in the same repository can use different
+`AGENTPARTY_CONFIG` files. The AgentParty cache itself is workspace-scoped, so
+the last writer previously made both status bars show the same agent name.
+The status bar now resolves the config used by each session's actual shell
+tool calls and overlays only that config's cached identity.
+
+Transcript parsing accepts real `tool_use` command records only. A later user
+or assistant message that merely quotes another valid config path cannot
+change the displayed identity. The bridge remains local-only: config tokens
+are never rendered, logged, or sent over the network.
+
+---
+
+## v3.29.10 — 2026-07-10
+
+### The legacy ⚠ chip is silenced by ANY projection, not just one with an ETA
+
+v3.29.8's dedup gate only hid the legacy average-pace countdown when the
+projection chip carried a depletion ETA. That left the contradictory case
+live: `→98% ⚠~25m` — the better model saying "you'll end under the cap"
+right next to the cruder one screaming "empty in 25 minutes". Whenever a
+usable projection exists it now wins outright; the ⚠ chip renders only when
+there is no projection to disagree with (projection disabled, or the
+early-window `→--` placeholder).
+
+---
+
+## v3.29.9 — 2026-07-10
+
+### Projection algorithm review — four fixes
+
+- **Snapshot throttling.** Every compute appended a backtest snapshot (0.4s
+  average gap live), so the 1000-entry cap covered 8.5 minutes of history —
+  useless for backtesting — while ~150KB of snapshots were re-parsed and
+  re-written by the daemon every second, its single largest CPU line. Now one
+  snapshot per window per 60s (~8h of history), and the store shrinks ~10x.
+- **Sample decimation.** Fractional-percent ticks stored a sample each
+  (2032 live); rate math reads the first/last of a ≥5-minute span, so
+  sub-0.5pp/sub-60s granularity was pure file weight. Skipped now.
+- **Burst rates clamp instead of vanishing.** A recent rate above the
+  sanity cap (60%/h for 5h) was discarded entirely, dropping the blend back to
+  the much slower window average at exactly the hottest moments — the
+  projection went LOW when it most needed to go high. It now pins at the cap.
+- **The →100%·ETA warning arrives minutes earlier.** The display smoother
+  eased toward a depleting raw projection over its full 8-minute tau, delaying
+  the warning. When the raw says ≥100% the approach is fast (τ=2min);
+  downward moves keep the slow tau, so cooldowns still don't flap.
+
+Known approximation, documented in code: the 7d depletion ETA inverts a
+bucket-integrated projection linearly and can overestimate time-left when
+near-term buckets are hotter than the tail.
+
+---
+
+## v3.29.8 — 2026-07-10
+
+### One countdown, not two
+
+v3.29.7's depletion ETA (`→100%·33m`, blended-rate) and the legacy
+average-pace forecast (`⚠~25m`) answer the same question with different
+estimators, and both rendered side by side — two disagreeing countdowns on one
+line. The legacy chip now yields whenever the projection carries an ETA, and
+remains the fallback for windows whose projection doesn't.
+
+---
+
+## v3.29.7 — 2026-07-10
+
+### A maxed projection now says WHEN the quota runs out
+
+`→100%` alone buried the useful half of the prediction. When the pace
+overshoots the cap, the chip now carries the estimated time until usage
+actually hits 100%: `5h[▓ 27%] 🕐4h19m →100%·1h12m` reads "headed to the cap,
+empty in about an hour". Computed from the same blended-rate projection
+(unclamped twin), only shown when depletion lands before the window reset.
+
+### Quiet channels no longer read as "listener down"
+
+AgentParty CLIs older than 0.2.80 heartbeat only when traffic arrives, so a
+listener on a quiet channel went heartbeat-stale after 10 minutes and the bar
+showed `⊘ listener down` while the process sat healthily connected (seen live:
+a serve alive with a 32-minute-old heartbeat). The process is the better
+witness: alive and verifiably a `party` process → `◉ watching/serving`,
+whatever the heartbeat age. A recycled PID (alive but not a party process)
+still reads as down. Upstream, AgentParty 0.2.83 also heartbeats on a 60s
+timer and an exiting `watch --once` no longer wipes another live listener's
+record.
+
+---
+
+## v3.29.6 — 2026-07-10
+
+### Documentation
+
+- **Clarified Claude Code vs Codex support.** The README now has an explicit
+  support matrix: Claude Code remains the full native `statusLine` integration
+  for quota/session/context/cache/activity data, while Codex support is the
+  local AgentParty bridge that shows channel, identity, listener state, unread
+  count, and last-message preview from
+  `~/.agentparty/state/<workspaceId>/statusline.json`.
+- **Updated the latest-release summary.** The top of the README now points to
+  v3.29.6 and summarizes the v3.29.5 daemon/session fixes instead of leaving an
+  older v3.28.x entry first.
+
+## v3.29.5 — 2026-07-09
+
+### launchd/systemd daemons were unkillable — and immune to upgrades
+
+`_process_is_our_daemon` matched the module path `claude_statusbar`
+(underscore), which only appears in lazy-spawned daemons
+(`python -m claude_statusbar.cli …`). A service-managed daemon's cmdline is
+`<venv python3> /path/to/cs daemon _run` — no underscore form anywhere. So for
+every launchd/systemd instance:
+
+- `cs daemon stop` refused with a false "PID reused. Refusing to SIGTERM".
+- The upgrade drift-kill (guarded since v3.29.1) also refused — the stale
+  daemon kept serving old code after every upgrade.
+
+The matcher now recognizes all spawn shapes, keyed on the shared
+`daemon _run` invocation.
+
+### The AgentParty line showed in sessions that never joined
+
+The AgentParty cache is cwd-scoped by contract, but Claude Code sessions are
+not: several windows share one project directory and only some of them join a
+channel (typically with a per-session `AGENTPARTY_CONFIG`). Every window in
+the directory rendered whichever session's channel/identity wrote the cache
+last — dead listeners and all.
+
+The env var never reaches the Claude Code process (agents export it inside
+individual Bash calls), so the line is now gated on the only session-scoped
+evidence there is: the session's own transcript. A window shows the party
+block only after its transcript contains a party command
+(`party init/send/watch/…` or `AGENTPARTY_CONFIG`). Scans are incremental
+(byte offset per session, sticky verdict), so a large transcript is read once
+and each later render reads only the appended tail. Sessions without a
+transcript (preview, tests, bare `cs`) keep the old always-show behavior.
+
+### An exiting daemon could delete the current owner's pidfile
+
+`flock` locks an inode, not a path: after an unlink+recreate cycle, two daemons
+each hold "the" lock on different inodes. `_release_pidfile` unlinked by path
+unconditionally, so the exiting daemon deleted the pidfile the *current* owner
+had just written — making it invisible to stop/status/spawn_if_dead, so the
+next render spawned a duplicate. Observed live twice in one day (a pidfile-less
+daemon looping for 15+ minutes beside a fresh one). Release now unlinks the
+locked file only while it still points at the exiting daemon's own inode.
+
+---
+
+## v3.29.4 — 2026-07-09
+
+### The daemon's auto-upgrade silently failed under launchd/systemd
+
+launchd and systemd run the daemon with the bare system PATH, which lacks
+`~/.local/bin` — where uv and pipx actually live. `shutil.which("uv")` failed
+there, so the upgrade fell through to `python -m pip install --upgrade` — and a
+uv tool venv ships **without pip**. Net effect: for uv installs whose daemon
+runs as an OS service, the daily auto-upgrade has never worked. Tool discovery
+now searches well-known directories (`~/.local/bin`, `~/.cargo/bin`, Homebrew)
+after PATH.
+
+### `cs upgrade` is now the one documented upgrade path
+
+Users kept being told (by READMEs and by agents guessing) to run
+`uv tool install …` — and many of them don't have uv, because they installed
+via pip. `cs upgrade` has picked the right channel since 3.28.1; now every
+surface says so: the README's Upgrading section, the claude-statusbar skill's
+decision tree (with an explicit "never guess a package-manager command" note),
+its trigger words (`upgrade`/`update`/`升级`), and `/statusbar-doctor`'s
+follow-up suggestions.
+
+---
+
+## v3.29.3 — 2026-07-09
+
+### The systemd unit had the same respawn loop v3.29.2 fixed on launchd
+
+v3.29.2 changed the launchd plist to `KeepAlive: {SuccessfulExit: false}` but
+left the systemd user unit at `Restart=always` — which relaunches even a clean
+exit. On Linux, whenever a lazy-spawned daemon held the pidfile, systemd's own
+instance exited 0 and was rerun every `RestartSec=5`, forever (and v3.29.2's
+exit-0 change made the loop *silent*). `cs daemon stop` also never stuck: clean
+exit, immediate relaunch. Now `Restart=on-failure` — crashes still bounce.
+Linux installs need `cs daemon install` re-run.
+
+### `mentions_only` now comes from the AgentParty contract, not `ps`
+
+AgentParty 0.2.79 writes `listener.mentions_only` into `statusline.json`
+(contract change shipped alongside this release). The statusbar reads it
+verbatim; the `ps` argv probe remains only as a fallback for older CLIs. This
+removes the last per-render fork on up-to-date installs and closes the
+pid-recycling staleness the memoised probe could serve.
+
+---
+
+## v3.29.2 — 2026-07-09
+
+### launchd was respawning a redundant daemon every 10 seconds
+
+The LaunchAgent shipped `KeepAlive: true`, which restarts the job on *any*
+exit. Whenever the thin client's lazy-spawn already owned the pidfile,
+launchd's own `cs daemon _run` found it taken, printed `daemon already
+running`, exited 1, and was relaunched `ThrottleInterval` seconds later —
+forever. A live `daemon.stderr.log` had **47429** such lines.
+
+`run_forever` now exits **0** when another daemon holds the pidfile (a daemon
+is running; this process's purpose is served), and the plist uses
+`KeepAlive: {SuccessfulExit: false}` so a clean exit ends the respawn while a
+real crash still bounces the daemon.
+
+Existing installs need `cs daemon install` re-run to pick up the new plist.
+
+### The test suite was writing into the user's real daemon log
+
+`test_render_payload_signal_alarm_aborts_slow_render` sets `RENDER_TIMEOUT_S`
+to 1 and lets a render time out, but `_log()` writes to the real
+`~/.cache/claude-statusbar/daemon.log`. Every `pytest` run appended a
+`render timed out after 1s` line there; **260** had accumulated, and they
+masked the daemon's genuine timeouts (logged as `after 12s`, none since
+2026-06-03). Diagnosing a "slow render" from that log meant reading test
+output as production signal. The test now stubs `_log`.
+
+### Warm renders are ~2.5x faster
+
+v3.29.0's `--mentions-only` probe forked `ps` on **every** render — about 4ms
+of a 6ms warm render. A process's argv never changes, so it is memoised per
+pid. Warm render: ~6.1ms → ~2.4ms.
+
+---
+
+## v3.29.1 — 2026-07-09
+
+### The daemon was crash-looping on slow renders
+
+`run_forever`'s sleep loop read the clock twice:
+
+```python
+end = time.time() + sleep_for
+while _running and time.time() < end:
+    time.sleep(min(0.2, end - time.time()))   # <- second read
+```
+
+If the process was descheduled between the guard and the subtraction, the
+remainder had already elapsed, `time.sleep()` got a negative number and raised
+`ValueError: sleep length must be non-negative`. The daemon died. Any render
+slower than the tick interval — the `render timed out after 1s` lines in
+`daemon.log` — made the window wide enough to hit routinely.
+
+This is the root cause behind v3.29.0's third fix. The orphan-`.tmp` sweep and
+the auto-update check were not merely starved by sharing a 30-minute timer; the
+daemon was being killed long before it could reach 30 minutes, then restarted by
+launchd. The remainder is now clamped at zero.
+
+---
+
+## v3.29.0 — 2026-07-09
+
+### AgentParty block redesign
+
+The AgentParty line answered none of the questions it existed to answer.
+
+- **`watch down` was a lie.** The statusline contract writes the listener
+  heartbeat as `heartbeat_ts`; `party.py` read `heartbeat_at`. It always got
+  `None`, so the heartbeat never looked fresh and *every live listener rendered
+  as `down`*. Two test fixtures wrote `heartbeat_at` too, so the bug was pinned
+  in place by its own tests.
+- **It was unreadable.** The whole line stacked the `FAINT` attribute on top of
+  the theme's dimmest grey. Colour is now assigned by meaning: channel in `ink`,
+  identity in `mute`, listening state green/red/grey, unread count amber.
+- **The message no longer crowds the header.** It gets its own line, clipped to
+  54 display columns with wide CJK glyphs counted as two, so a long preview
+  cannot push the header off screen.
+- **The listening state is stated outright** — `◉ watching` / `◉ serving`
+  (green), `⊘ listener down` (red), `◌ not listening` (grey, no listener
+  attached). `@mentions` is appended when the live listener runs with
+  `--mentions-only`, detected from its argv.
+- **The message carries its own state**: `●` unread / `○` read, followed by `@`
+  when the preview mentions your identity. Mention matching is exact, so
+  `@leo-zego-im` does not mark `leo-zego`. (The writer clips previews at 48
+  chars, so a mention past that cut is missed — it under-reports, never
+  over-reports.)
+- Emoji gave way to monochrome geometry (`⬡` agent, `⬢` human). Glyphs now
+  inherit the theme colour and hold a single column.
+
+### Daemon restart fixes
+
+Found while investigating "I upgraded but nothing changed".
+
+- **The code-drift tick burned its own spawn debounce.** On detecting drift the
+  thin client SIGTERMed the old daemon and immediately called
+  `_spawn_daemon_async()`. The old daemon was still alive handling the signal,
+  so `spawn_if_dead` found a valid pidfile and refused — after the 30s debounce
+  marker had already been stamped. Every session then inline-rendered for 30
+  seconds. The drift tick no longer spawns; the next tick (~1s) does.
+- **`_signal_outdated_daemon` could SIGTERM an unrelated process.** A session's
+  meta outlives the daemon that wrote it, so `meta["pid"]` may have been
+  recycled. It now verifies `_process_is_our_daemon(pid)` first — the guard that
+  the function's own docstring already claimed to apply.
+- **The orphan-`.tmp` sweep and the auto-update check were starved.** Both hung
+  off the session-GC timer, which is seeded to daemon start and fires after 30
+  minutes. Since the thin client restarts the daemon on every code drift, it
+  rarely lived that long and neither ever ran. Observed live: 15 orphaned `.tmp`
+  files, the oldest 99 minutes old, against a 60-minute cutoff. Maintenance now
+  runs on the first tick; session GC keeps its deferral.
+
+---
+
+## v3.28.2 — 2026-07-09
+
+### Fixed
+- **`cs upgrade` detects uv-tool installs correctly.** uv tool environments
+  symlink `bin/python3` to the shared uv Python install; the upgrade detector now
+  checks the original executable path and environment prefix before falling back
+  to the resolved Python path, so `cs upgrade` selects
+  `uv tool install --upgrade claude-statusbar` instead of a non-working venv pip.
+
+## v3.28.1 — 2026-07-09
+
+### Added
+- **Foreground upgrade command.** `cs upgrade` now upgrades the install channel
+  that is actually running `cs` (`uv tool`, `pipx`, or plain `pip`), which avoids
+  the confusing case where `pip install -U claude-statusbar` updates a different
+  Python environment than the `cs` shim on `PATH`.
+- **Version aliases.** `cs -v`, `cs -V`, and `cs -version` now behave like
+  `cs --version`.
+
+## v3.28.0 — 2026-07-09
+
+### Added
+- **AgentParty / Codex bridge line (`show_party`, default on).** When the same
+  workspace has an AgentParty local status cache, the bar appends a local-only
+  line such as `🎈 #agentparty · 🤖 xdream-agent · 👂serve · 3 unread · bob:
+  shipped the auth patch 2m`. This is designed for Codex + AgentParty workflows:
+  the writer side runs in AgentParty, while `cs` only reads
+  `~/.agentparty/state/<workspaceId>/statusline.json`.
+- **Shared workspace id contract.** The reader matches AgentParty's cwd-scoped
+  `workspaceId` algorithm and has fixture tests for macOS `/tmp` behavior, so
+  Codex/AgentParty and Claude Code renders point at the same local state file.
+
+### Changed
+- **Documentation now separates Claude Code and Codex support.** Claude Code
+  remains the full native `statusLine` data source for quota/session fields;
+  Codex support is the local AgentParty presence/channel/unread bridge and does
+  not make network requests or read AgentParty tokens.
+
+### Fixed
+- **Stale listener state degrades visibly.** If the AgentParty cache is older
+  than 10 minutes, or the recorded listener pid is gone, the appended line marks
+  `stale` / `down` instead of showing a live listener.
+
+## v3.27.0 — 2026-07-03
+
+IP-risk detection re-synced with the ip-check.leeguoo.com service (this module
+mirrors its `classify` + `claude-verdict`); both diverged and are now aligned.
+
+### Added
+- **China-cloud detection.** Claude account-risk systems flag Chinese clouds
+  (Alibaba/Aliyun, Tencent/QCloud, Huawei, ByteDance/Volcengine, Baidu, UCloud,
+  Kingsoft…) by provider **org/ASN**, not by where the IP geolocates — so a
+  Chinese cloud's *US* node still counts. The local scorer now detects these by
+  org keyword and ASN, adds a +25 risk weight on top of hosting (33 → 58, 中度;
+  worse than a neutral AWS-US datacenter at 60), and exposes a `china_cloud`
+  flag. A CN-registered but non-hosting org (a normal residential ISP) is *not*
+  misclassified as a cloud. This is the most relevant signal for the tool's
+  audience — users on a Chinese cloud's overseas node — which was previously
+  scored as an ordinary datacenter and let through.
+
+### Fixed
+- **Ban-risk threshold aligned with the crit band.** `verdict()` treated
+  `risk >= 67` as ban-risk while `classify()`'s crit band is `risk >= 70`, so
+  scores 67–69 on a non-anonymizer type read as ban-risk in one place and only
+  中度 in the other. Both now use 70 (matching the ip-check service fix).
+
+## v3.26.0 — 2026-07-03
+
+Community issue sweep — all four open issues fixed (#29 #30 #31 #32).
+
+### Fixed
+- **Windows: `cs doctor` / `cs --setup` false-positive "not ours" (#32).**
+  `shutil.which("cs")` on Windows resolves to `cs.EXE`; the basename never
+  exact-matched our command names, so setup refused to configure and doctor
+  always flagged a foreign statusLine. Command basenames are now lowercased
+  and stripped of the pip/pipx shim extensions (`.exe`/`.cmd`/`.bat`) before
+  matching. Foreign tools ending in `.exe` are still refused.
+- **Windows: unbounded daemon process leak (#31).** The old no-`fcntl`
+  fallback always returned True ("honor system"), so every stale render tick
+  spawned another daemon (~150 orphans/day reported). Three defenses now:
+  a real `msvcrt.locking` exclusive lock on a separate `daemon.lock`
+  sentinel (locking `daemon.pid` itself would blind `stop`/`status` —
+  Windows byte locks are mandatory), a ctypes `OpenProcess` liveness probe
+  (`os.kill(pid, 0)` on Windows *terminates* the target), and a 30s spawn
+  debounce in the thin client so even a broken lock leaks at most one
+  short-lived process per 30s. *Not yet verified on real Windows — feedback
+  welcome on #31.*
+
+### Added
+- **`CLAUDE_CODE_AUTO_COMPACT_WINDOW` / `CLAUDE_CODE_DISABLE_1M_CONTEXT`
+  respected for the ctx gauge (#29).** Users who raise the context window
+  (e.g. `400000`) no longer see ctx% computed against the stock window;
+  a truthy `CLAUDE_CODE_DISABLE_1M_CONTEXT` caps a >200K reported window
+  back to 200K. Empty/invalid values keep current behavior.
+- **`show_cwd` toggle (#30).** Opt-in working-directory segment (default
+  off) rendered from stdin's `workspace.current_dir` — zero extra I/O.
+  `cwd_style` chooses `basename` (default) or `full`; the segment is
+  skipped when it would just repeat the project name.
+
+## v3.18.0 — 2026-06-29
+
+### Added
+- **Stale-quota hint instead of silently blank 5h/7d bars.** When the statusLine
+  pipeline stops feeding cs (another tool displaced the statusLine, or the daemon
+  died) the cached 5h/7d windows expire and the expiry guard hid both bars —
+  indistinguishable from a fresh session, so it just looked *broken*. The bar now
+  shows `⟳ 5h/7d stale·restart` (yellow) in that exact case, telling you it's
+  stale and a restart refreshes it. Gated tightly: only fires when the client
+  emits rate_limits, an assistant turn already exists (a healthy session would
+  have data by then), and the quota cache is genuinely all-expired — so a real
+  session-start still shows the normal `--%` placeholders, never a false alarm.
+- **`cs doctor` now reports 5h/7d quota-cache freshness** — `fresh` / `empty` /
+  `stale (last update Nh ago … restart Claude Code; if it persists another tool
+  took the statusLine → cs --setup)`. Turns the cache-file archaeology a user
+  otherwise had to do into one diagnostic line.
+
+## v3.17.0 — 2026-06-29
+
+### Added
+- **Balance fuel-gauge battery (`balance_bar`, default on).** The relay balance
+  now renders as a battery bar — `bal[████ 52%] $26.00` — where the fill is the
+  **remaining** proportion (a fuel/phone-battery mental model: full = green,
+  getting low = yellow ≤25%, nearly empty = red ≤10%), with the remaining amount
+  trailing. So you see both how much is left (the gauge + %) and the absolute
+  figure at a glance. Falls back to the plain `bal $X` text when the relay
+  reports no usable hard-limit (some relays return a sentinel/zero limit, which
+  would make a gauge misleading). Turn the bar off with
+  `cs config set balance_bar false` to keep the plain text.
+- **`.claude-plugin` marketplace/plugin manifests re-synced to 3.16.0** — they
+  were left at 3.15.1 by the v3.16.0 release (PyPI package was correct).
+
+## v3.16.0 — 2026-06-29
+
+### Added
+- **Relay account balance in no-quota mode (`show_balance`, default on, auto).**
+  When you're on a third-party relay / API key (no official 5h/7d quota), the bar
+  can now show `bal $X.XX` — your remaining relay balance. A detached helper
+  probes the relay's OpenAI-compatible billing endpoint
+  (`/dashboard/billing/subscription` + `/usage`, the new-api / one-api de-facto
+  standard) with your key, computes `hard_limit − used/100`, and caches it 5 min
+  (a relay that 404s is remembered as unsupported for 1 h, so we don't re-probe
+  every render). Fully automatic: **shown only if the relay actually answers,
+  silently hidden otherwise** — subscribers and unsupported relays see nothing,
+  zero config. The probe always runs in a separate process (like the git
+  dirty-state refresh), so it never blocks the bar; the default `Python-urllib`
+  User-Agent is replaced because some Cloudflare-fronted gateways 403 it. Turn
+  off with `cs config set show_balance false`.
+
+---
+
+## v3.15.1 — 2026-06-29
+
+### Fixed
+- **`git status` refresh no longer strands `.git/index.lock`.** The background
+  dirty-state poll now runs with `--no-optional-locks`, so a slow repo hitting
+  the 2 s timeout (and getting killed) can't leave a stale lock that blocks your
+  own next `git add` / `commit` / `rebase`.
+- **`cs config set warning_threshold` / `critical_threshold` now actually
+  affect the bar.** The render path hardcoded 30/70 and never read the saved
+  config; severity thresholds now resolve **CLI flag → env → config → default**.
+- **Context-window colour is consistent across modes.** The model name's
+  context-fill colour now uses the 70/85 context band (not the 30/70 comfort
+  band), so ~35% context reads calm green instead of a false yellow in quota
+  mode — matching the no-quota `ctx[…]` bar. Applied to all three styles.
+- **Per-session no-quota detection under the shared daemon.** Relay /
+  `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` env signals are now read
+  per session (stamped by the thin client into the payload) instead of the
+  daemon's frozen start-time `os.environ`, fixing mis-detection when sessions
+  with different backends share one daemon.
+- Concurrent `git status` cache writes use a unique temp file (no more
+  cross-write corruption / 30 s freeze); the reset-time exception fallback
+  returns `--` instead of a wrong "next 2 PM (local)" estimate.
+
+### Changed
+- Removed the orphaned claude-monitor cache subsystem (`try_original_analysis`,
+  `direct_data_analysis`, `cache_refresh.py`, and the `cache.py`
+  `read_cache`/`write_cache`/`refresh_cache_background` trio) — all dead code.
+  The displayed `$` figure comes from Claude Code's own `session_cost_usd`, so
+  no local token pricing is needed. Net −430 lines, no behaviour change.
+
+---
+
+## v3.15.0 — 2026-06-22
+
+### Added
+- **No-quota mode for third-party relays / Bedrock / Vertex.** When Claude Code
+  points at a relay (`ANTHROPIC_BASE_URL` ≠ `api.anthropic.com`) or a cloud
+  backend (`CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`), Anthropic's
+  official 5h/7d quota doesn't exist — so the bar now drops the two quota
+  battery bars and **promotes the context window to its own `ctx[…]` battery
+  bar** (green→yellow→red on 70/85% used), keeping the model name, prompt-cache
+  countdown, and live-activity tail. Previously the bar showed empty quota bars
+  or, worse, back-filled a previous official session's cached quota as fake
+  current numbers. Implemented for all three styles (classic / capsule /
+  hairline); inspired by [claude-hud](https://github.com/jarrodwatts/claude-hud).
+- Detection is automatic (`api_mode = auto`, the default), with a transcript
+  heuristic (gated on a Claude Code version that emits rate_limits, so old-client
+  official users aren't misread) as a fallback when the env var doesn't reach the
+  statusLine subprocess. Force with `cs config set api_mode on` or `CS_API_MODE=on`;
+  disable with `api_mode off`. Works under both the inline and daemon render paths.
+
+---
+
+## v3.14.1 — 2026-06-16
+
+### Changed
+- **Projection coloring red line lowered to 85% (yellow now 70–84%, green
+  below 70%).** A 7d window projecting `→99%` was showing yellow because red
+  only started at the cap (100%) — but the `→NN%` chip is clamped to 100 and
+  the slow 7d window can sit at 99% for a long time, so "basically going to run
+  out" was reading as merely warm. Red now starts at 85%, where a projection is
+  effectively a sure exhaustion. The `→NN%` chip itself now uses the same
+  red/yellow lines as the bar so they never disagree.
+
+---
+
+## v3.14.0 — 2026-06-16
+
+### Changed
+- **Rate-limit windows (5h/7d) now color by where usage is HEADED, not where it
+  is right now.** Once a `→NN%` end-of-window projection exists, the window's
+  bar fill, label, and ⏰ clock take a severity from the *projected* value
+  against the cap: green below 80%, yellow 80–99%, red at 100%. The bar's fill
+  LENGTH and printed % still track current usage — only the color is projected.
+  So a 7d window sitting at 24% but on track for →96% now reads yellow instead
+  of a falsely-healthy green. Applies to all three styles (classic bar, capsule
+  `●` dot, hairline mini-bar). Before a projection exists, the window falls back
+  to current-usage coloring on the configured thresholds (unchanged).
+
+### Fixed
+- **The `→NN%` projection no longer reads far too low for the first ~15 minutes
+  after a window resets.** The smoother was seeded from the `used=0` first
+  post-reset tick (where the raw projection collapses to the bucket prior ~2%),
+  then crawled up with an 8-minute time-constant — so a 5h window 6 minutes in
+  at 1% used showed `→14%` when the pace already implied ~50%+. The projection
+  now holds the `→--` placeholder until `MIN_ELAPSED` (5h=10m, 7d=1h) — the same
+  floor the ⚡ETA chip already uses — and then seeds from the first trustworthy
+  reading (no lag). During the hold the window colors by current usage, an
+  honest "not enough signal yet" instead of a fake-precise low number.
+
+---
+
+## v3.13.7 — 2026-06-12
+
+### Fixed
+- **Parallel sessions logged into different Claude accounts no longer
+  cross-contaminate the 5h/7d display.** The statusline stdin blob does not
+  identify which account produced it, so with multiple accounts running
+  side-by-side, ALL sessions wrote into the current login's shared store — and
+  the "later resets_at wins" merge let another account's 7d window mask the
+  real one with no heal path (live incident: bar showed the other account's
+  7d 14% while `/usage` said 77%). A reading's identity is now
+  `(window, resets_at)`: the shared store keeps per-reset buckets, each render
+  is answered from the bucket matching its OWN blob's reset, and all
+  v3.13.3–v3.13.5 healing rules (monotonic merge, confirmation grace,
+  re-baseline acceptance) apply unchanged within a bucket. Legacy store
+  schemas migrate automatically.
+- **`→NN%` projections were artificially conservative during heavy use.**
+  Three stacked causes: (1) the cross-account bug above also starved the real
+  window's projection samples (samples for an earlier-reset window were
+  rejected outright — the live window had 2 samples in 28h, leaving →NN% on
+  cold priors); (2) a flat 20%/h plausibility cap silently rejected genuine
+  heavy parallel-session burn (observed 37%/h on the 5h window), so the
+  "recent rate" never existed exactly when it mattered — caps are per-window
+  now (5h 60%/h, 7d 10%/h) with a ≥300s observation-span floor as the glitch
+  filter; (3) the 7d projection ignored current momentum entirely — the rate
+  measured over the last 3h now carries the next ≤3h (it can only raise the
+  bucket estimate, never lower it).
+
+### Changed
+- **Battery bar fill is now a same-hue gradient.** The left cell anchors the
+  exact severity colour (green/yellow/red semantics unchanged), fading darker
+  toward the progress tip by scaling toward black — hue stays rich, the tip
+  melts softly into the empty section, and a lone filled cell stays pure
+  colour. Bar frame, ⏰, separators and all classic identity elements are
+  untouched.
+
+---
+
+## v3.13.6 — 2026-06-11
+
+### Fixed
+- **Switching Claude accounts no longer keeps showing the previous account's
+  5h/7d usage.** The shared stores (`rate_latest.json`, `rate_projection.json`)
+  were account-global with no account key, so after `/login` to a different
+  account the old account's reading stayed "plausible" for days and its later
+  `resets_at` won every reconcile merge — the bar stayed pinned to the old
+  account's percentages (and its learned `→NN%` projections) until the old
+  window expired. Both stores are now keyed by the logged-in account
+  (`oauthAccount.accountUuid` from `~/.claude.json`, memoized on file
+  mtime/size — renders normally pay only a `stat()`): each account gets its own
+  `rate_latest.<uuid>.json` / `rate_projection.<uuid>.json`, switching back
+  restores that account's own data, and when the account can't be detected
+  (API-key/headless setups) the legacy unsuffixed paths keep working unchanged.
+
+---
+
+## v3.13.5 — 2026-06-10
+
+### Fixed
+- **The `→NN%` projection relearns after an official re-baseline instead of
+  freezing for the rest of the window.** The sample recorder refused any
+  same-window reading at or below the recorded max — meant to filter stale
+  session replays, but those are already gated upstream by the reconcile merge
+  (v3.13.3/v3.13.4). After Anthropic re-baselined the weekly limit (19% → 3%),
+  no new sample could be recorded until usage exceeded the old 19%, so the
+  projection kept showing a pre-rebaseline `→100%` for days. A converged
+  reading below the same-reset max now means the limit changed: all stored
+  samples for that window are in old-denominator units and incomparable, so
+  they're dropped, display smoothing restarts, and the projection relearns
+  from the window's bucket priors onward.
+
+---
+
+## v3.13.4 — 2026-06-10
+
+### Fixed
+- **Idle Claude Code windows can no longer pin the 5h/7d bars to hours-old
+  readings.** An open-but-idle window replays its last `rate_limits` blob on
+  every statusline render. If that blob's `five_hour` `resets_at` is already in
+  the past, the whole blob is hours old (a fresh API response always carries a
+  future 5h reset) — yet its `seven_day` value still looked plausible and kept
+  "re-confirming" the shared store, defeating v3.13.3's 120s re-baseline grace
+  (observed live: frozen sessions replaying 7d=15% blocked the official 3%
+  indefinitely). Blob freshness is now judged as a whole: a blob with any
+  implausible window reset neither overwrites the shared reading nor restarts
+  the grace clock.
+
+---
+
+## v3.13.3 — 2026-06-10
+
+### Fixed
+- **5h/7d bars no longer stick at a stale high % when Anthropic re-baselines
+  usage mid-window.** When account limits change (e.g. the weekly limit is
+  raised), the official `used_percentage` can drop within the same window —
+  observed live: `/usage` said 3% while the bar was pinned at 19% (and would
+  have stayed there until the weekly reset). The cross-session merge assumed
+  "within a window, used% only grows" absolutely; it now tracks when the stored
+  reading was last confirmed by any live session (`observed_at` in
+  `rate_latest.json`) and accepts an official downward revision once the old
+  value has gone unconfirmed for 120s. Stale idle-session replays still can't
+  drag the bar down — any session that still sees the higher value re-confirms
+  it every render and keeps the grace clock ticking. Pre-existing stores
+  without `observed_at` heal on the first render after upgrading.
+
+---
+
+## v3.13.2 — 2026-06-09
+
+### Changed
+- **Effort gradient reworked to match Claude Code's own effort ladder.** A vivid
+  monotonic cool→purple spectrum — low/auto teal · medium azure · high blue ·
+  xhigh indigo · max violet · **ultracode** magenta — with each tier sweeping
+  toward the next hue so it reads as a real gradient (not a flat block) and the
+  level is obvious. (The old rainbow made coral `max` look "hotter" than
+  `ultracode`, inverting the order.)
+- **`ultracode` is shown as `ultracode(+workflows)`** to spell out what it means
+  (Claude Code: `ultracode = xhigh + workflows`).
+
+---
+
+## v3.13.1 — 2026-06-07
+
+### Fixed
+- **The `→NN%` projection no longer vanishes near a reset.** v3.12.1 hid the
+  projection when it rounded to the current usage (to avoid a redundant-looking
+  `→47%` next to `47%`), but that made it disappear entirely on a window that's
+  nearly reset or flat. It's now always shown — `→47%` next to `47%` is honest
+  ("you'll end about here"), not broken.
+
+---
+
+## v3.13.0 — 2026-06-07
+
+### Added
+- **Session-mode line (`show_mode`, default on).** A dedicated `⚙` line shows
+  how the current turn is configured — `⚙ effort:high · think:on · fast:off ·
+  style:default` — read straight from Claude Code's stdin (`effort.level`,
+  `thinking.enabled`, `fast_mode`, `output_style`). Each field is dropped when
+  absent. `cs config set show_mode false` to hide.
+- **Per-effort gradient (`mode_gradient`, default on).** The whole mode line is
+  tinted with a static gradient whose palette depends on the effort tier — a
+  cool→hot ladder so the level is obvious at a glance: low/auto slate, medium
+  blue, high cyan, xhigh amber, max coral, ultracode pink→purple. Static, not
+  animated: an external statusLine is re-invoked at ≤1 Hz, so motion can only
+  flicker — a stable per-tier sweep is the clean result. `cs config set
+  mode_gradient false` falls back to plain per-tier text colours.
+
+### Fixed
+- **Reconcile rejects implausible reset times.** A bogus far-future `resets_at`
+  (e.g. from corrupt/odd input) used to poison the account-global reconcile
+  store permanently — "later reset wins" meant the real, smaller reset could
+  never replace it, showing absurd timers like `⏰2283122h`. Reconcile now
+  ignores resets beyond a window-length-plus-slack and lets a plausible reading
+  replace a poisoned one (self-healing).
+
+---
+
+## v3.12.1 — 2026-06-07
+
+### Fixed
+- **Projection no longer echoes the current usage.** The `→NN%` projection is
+  floored at current usage, so when it predicted no visible growth it would
+  render right next to an identical number (`1% … →1%`) and read as a broken
+  chip. It's now shown only when it forecasts a higher whole percentage;
+  otherwise it's hidden (e.g. near a reset, or while usage is flat).
+- Release guard: `pyproject.toml`, `.claude-plugin/marketplace.json`, and
+  `.claude-plugin/plugin.json` versions are now kept in lock-step (a test fails
+  the build if they drift) — the marketplace had silently lagged at 3.10.0.
+
+---
+
+## v3.12.0 — 2026-06-05
+
+### Added
+- **Version on the bar (`show_version`, default on).** A faint `· vX.Y.Z` at the
+  very end of the identity line — rendered in the darkest grey + a dim attribute
+  so it's there when you look but never competes for attention. (Terminals can't
+  shrink the font, so "faint" is how it stays unobtrusive.) Disable with
+  `cs config set show_version false`.
+- **Update hint.** When a newer version is on PyPI, an amber `↑<newver>` appears
+  right after the version (e.g. `· v3.11.2 ↑3.12.0`). The background update check
+  caches the latest version locally; the render path only reads that cache (no
+  network, no per-second cost) and shows the arrow when newer — and stays silent
+  if the cached check is stale.
+
+---
+
+## v3.11.2 — 2026-06-05
+
+### Changed
+- **`show_lines` is now on by default.** The identity line shows Claude Code's
+  session lines-changed tally (`+182 -47`, +green/−red) out of the box. Disable
+  with `cs config set show_lines false`.
+- **Changelog is easier to find.** The PyPI project page now links the changelog
+  and releases directly (project URLs), so you can see what changed without
+  digging through the repo.
+
+---
+
+## v3.11.1 — 2026-06-04
+
+### Fixed
+- **Projection learning data is now kept clean.** The `→NN%` learner could be
+  polluted by stale/odd samples; hardened so it learns only trustworthy slopes:
+  - projections now reconcile against the account-global latest reading first,
+    so an old Claude window can't write an expired low percentage into history;
+  - within a reset window only increasing usage change-points are kept (no
+    per-render duplicates), and bucket-rate learning ignores duplicate,
+    decreasing, and cross-reset samples — killing the false high slopes that the
+    coarse integer `used_pct` steps used to create;
+  - a window is only recorded as "closed" when its reset time moves *forward*, so
+    an old session bouncing backwards no longer looks like a new window.
+- **The bar itself now reconciles too.** The `5h/7d` percentage and reset timers
+  use the same account-global reconciled reading as the projection/forecast, so
+  all open windows show consistent numbers (previously only the projection did).
+
+### Changed
+- **Per-tick projection cache.** Projection results are memoized for ~1s keyed on
+  the reconciled reading, and history is compressed + bounded on load, so the
+  render path doesn't recompute the learned model every tick.
+
+---
+
+## v3.11.0 — 2026-06-02
+
+### Added
+- **Always-visible rate-limit projections (`show_projection`, default on).**
+  The 5h/7d windows now show `→NN%` estimates for expected end-of-window usage.
+  The model records local samples, learns coarse usage rhythm, smooths by sample
+  time instead of render frequency, and keeps a bounded error log for future
+  tuning. Disable with `cs config set show_projection false`.
+- **Separate imminent ETA warning (`show_forecast`, default on).** `show_forecast`
+  now controls only the `⚠~ETA` chip, which appears after the projection when a
+  window is projected to hit 100% before reset and the cap is imminent.
+
+### Fixed
+- **`context_window.used_percentage = null` handled as unknown.** Claude
+  sometimes sends `null`; rendering now treats it as unknown (context tokens
+  fall back to input+output token totals) instead of dropping into the
+  expensive claude-monitor reset-time fallback path.
+
+### Changed
+- **Daemon renders only active windows.** `_active_sessions()` now uses a 10s
+  freshness window (sorted freshest-first) rather than the 24h GC threshold, so
+  stopped Claude windows keep their dirs for GC but leave the 1Hz work set. The
+  thin client only signals an "outdated daemon" when the daemon genuinely
+  predates the installed package code — not on ordinary age-stale output (which
+  was letting a slow shared daemon get killed by sessions it hadn't reached).
+
+---
+
+## v3.10.0 — 2026-06-02
+
+### Added
+- **Live-activity line (3rd line).** An opt-in third status line surfaces what
+  Claude is doing *right now*, parsed from the transcript via the same bounded
+  reverse-tail read (≤320 KB) the cache countdown already uses:
+  - **Todos** `▸ <in-progress task> (3/7)` — from the newest `TodoWrite` (full
+    list, last-write-wins). On by default (`show_todos`); it's the clearest
+    "is my long turn making progress?" signal.
+  - **Active tool** `◐ Edit auth.py` (newest tool_use with no result yet). MCP
+    names shortened (`mcp__figma__get_screenshot` → `get_screenshot`). Opt-in
+    (`show_tools`). A separate completed-tool rollup `✓ Edit×14 Bash×6` is
+    available via `show_tool_rollup` (a volume tally; default off).
+  The line is style-agnostic (renders the same under classic / capsule /
+  hairline) and is omitted entirely when nothing is active. The curated
+  main line is untouched.
+- **Identity line gains opt-in session context.** Next to `⤷ project ⎇ branch`:
+  - **git ahead/behind** `↑2↓1` (`show_ahead_behind`) — reuses the dirty-state
+    `git status --branch` call, no extra spawn; arrows only for nonzero
+    directions.
+  - **session duration** `⏱ 12m` (`show_duration`) and **lines changed**
+    `+182 -47` (`show_lines`, +green/−red) — straight from stdin. These are
+    Claude Code's own cumulative session tally, not a git diff.
+- **Running subagents** — one **bottom line per agent** `◐ explore[haiku]
+  <task> 2m15s` (`show_agents`, opt-in, **default off**). Background agents are
+  detected as running until their queue-operation task-notification (their
+  immediate launch-ack tool_result does *not* count as completion). Off by
+  default because Claude Code already shows background agents in its own
+  native panel, so enabling this largely duplicates it.
+- **`.claude-plugin/marketplace.json`** — the repo is now a self-hosted plugin
+  marketplace: `/plugin marketplace add leeguooooo/claude-code-usage-bar` then
+  `/plugin install claude-statusbar`. (The render engine is still the `cs` CLI
+  from PyPI.)
+- **`bar_shimmer` (experimental, opt-in, default off, classic only)** — a faint
+  twinkling starfield in the *empty* portion of the 5h/7d battery bars: a static
+  high/mid/low dot field with bright stars (`✦`/`✧`) winking in and out. The
+  fill color is never changed. Capped at the statusLine's ~1Hz refresh, so it's
+  a gentle twinkle, not a smooth animation. `cs config set bar_shimmer true`.
+- **Local worktree detection** — the identity line shows a bare `[worktree]`
+  marker when the checkout is a linked git worktree (detected from `.git`
+  pointing under `worktrees/`), independent of whether Claude Code passes the
+  hint.
+
+### Changed
+- **One transcript scan, not two.** The cache countdown and the activity line
+  now share a single bounded reverse-tail read (`read_activity` also returns
+  `cache_age_seconds`/`cache_ttl`). Also makes the cache countdown
+  **per-session-correct** — it reads the session's own transcript instead of
+  the shared top-level `last_stdin.json` (which is last-writer-wins across
+  windows and could show another session's cache age).
+
+### Fixed
+- **Auto-update now actually runs in daemon mode, without blocking renders.**
+  Previously the once-a-day check only fired on the rare inline-fallback path
+  (the daemon suppresses it and `cs render` just cats a frame), and when it did
+  fire it ran the upgrade *synchronously* (up to ~65s) in the triggering render.
+  Now the check spawns a **detached** background upgrade (never blocks), and the
+  **daemon** triggers it on its own 24h-throttled cadence. After a successful
+  upgrade the package mtime changes and the daemon restarts onto new code via
+  the existing code-drift detection.
+
+### Robustness
+- The activity scan is fully defensive against malformed transcript shapes
+  (non-string `file_path`, non-dict tool `input`, non-string `timestamp`) and
+  is wrapped so any scanner failure degrades to "no activity line" rather than
+  blanking the whole status bar — the scan runs before `main()`'s try/except.
+
 ## v3.9.1 — 2026-05-29
 
 ### Changed

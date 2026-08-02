@@ -26,6 +26,27 @@ SKILLS_DIR    = Path.home() / ".claude" / "skills"
 # CLI binary names we ship — `cs` is shortest and the documented one.
 OUR_COMMAND_NAMES = ("cs", "cstatus", "claude-statusbar")
 
+# Launcher shims pip/pipx create on Windows around our entry points.
+# shutil.which can also return uppercase extensions there ("cs.EXE"),
+# so matching must lowercase first (see _normalize_command_name).
+_WINDOWS_SHIM_EXTENSIONS = (".exe", ".cmd", ".bat")
+
+
+def _normalize_command_name(name: str) -> str:
+    """Normalize a binary basename for matching against OUR_COMMAND_NAMES.
+
+    On Windows, shutil.which("cs") resolves to "...\\cs.EXE" and pip writes
+    "cs.exe"/"cs.cmd" shims — an exact match against "cs" would then fail,
+    making doctor report "(not ours)" and --setup refuse to touch a
+    perfectly valid entry (issue #32). Lowercase and strip the known shim
+    extension before comparing.
+    """
+    name = name.lower()
+    for ext in _WINDOWS_SHIM_EXTENSIONS:
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return name
+
 
 def _resolve_cs_command() -> str:
     """Best-effort absolute path to our `cs` binary.
@@ -45,7 +66,7 @@ def _resolve_cs_command() -> str:
 
     # If we're being invoked as `python -m claude_statusbar`, sys.argv[0] is the script
     argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
-    if argv0 and argv0.is_file() and argv0.name in OUR_COMMAND_NAMES:
+    if argv0 and argv0.is_file() and _normalize_command_name(argv0.name) in OUR_COMMAND_NAMES:
         return str(argv0.resolve())
 
     for p in (
@@ -89,6 +110,18 @@ def _statusline_config(fast: bool = False, refresh_interval: int = DEFAULT_REFRE
     }
 
 
+def _invokes_our_module(cmd: str) -> bool:
+    """True for ``<python> -m claude_statusbar.cli render``.
+
+    A legitimate way to run us that skips pip's console-script launcher. On
+    Windows that launcher spawns a second process, roughly doubling status-line
+    latency (~0.9s vs ~0.44s per render on a conda install), so users on slow
+    Python startups may prefer the module form. Recognise it as ours rather
+    than reporting it as a foreign tool.
+    """
+    return "claude_statusbar" in cmd
+
+
 def _is_our_statusline(entry: object) -> bool:
     """Return True if the existing statusLine entry already points at our CLI."""
     if not isinstance(entry, dict):
@@ -96,7 +129,9 @@ def _is_our_statusline(entry: object) -> bool:
     cmd = entry.get("command")
     if not isinstance(cmd, str) or not cmd.strip():
         return False
-    name = Path(cmd.strip().split()[0]).name  # strip args + path
+    if _invokes_our_module(cmd):
+        return True
+    name = _normalize_command_name(Path(cmd.strip().split()[0]).name)  # strip args + path + .exe shim
     return name in OUR_COMMAND_NAMES
 
 
@@ -137,7 +172,9 @@ def _existing_uses_render(existing) -> bool:
     if not isinstance(cmd, str):
         return False
     parts = cmd.strip().split()
-    return len(parts) >= 2 and parts[1] == "render"
+    # `cs render`, and the module form `<python> -m claude_statusbar.cli render`
+    # — in both, `render` is the last token.
+    return len(parts) >= 2 and parts[-1] == "render"
 
 
 def ensure_statusline_configured(fast: Optional[bool] = None) -> Tuple[bool, str]:
@@ -196,6 +233,13 @@ def ensure_statusline_configured(fast: Optional[bool] = None) -> Tuple[bool, str
     else:
         effective_refresh = DEFAULT_REFRESH_INTERVAL
     desired = _statusline_config(fast=effective_fast, refresh_interval=effective_refresh)
+
+    # The module form is a deliberate choice (see `_invokes_our_module`), not
+    # drift — the daily repair pass must not rewrite it back to the console
+    # script. Keep the command, still refresh refreshInterval.
+    existing_cmd = existing.get("command")
+    if isinstance(existing_cmd, str) and _invokes_our_module(existing_cmd):
+        desired["command"] = existing_cmd
 
     if (existing.get("command") != desired["command"]
             or existing.get("refreshInterval") != desired["refreshInterval"]):
@@ -299,18 +343,26 @@ def _packaged_skills_dir() -> Path:
     return here.parent / "skills"
 
 
-def install_commands(force: bool = False) -> Tuple[int, list[str]]:
+def install_commands(force: bool = False) -> Tuple[int, list, list]:
     """Copy bundled slash commands into ~/.claude/commands/.
 
-    Returns (count_installed, list_of_skipped_paths).
+    Returns (count_installed, skipped, failed).
+
+    The two lists mean very different things and must not be conflated:
+
+    - `skipped` — the file exists with content the user changed, so we leave it
+      alone. Entirely benign, and re-running the installer (the documented
+      upgrade path) hits it every time. Must never make the exit code non-zero.
+    - `failed` — we tried to write and could not. A real problem.
     """
     src_dir = _packaged_commands_dir()
     if not src_dir.is_dir():
-        return 0, []
+        return 0, [], []
 
     COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
     installed = 0
-    skipped: list[str] = []
+    skipped: list = []
+    failed: list = []
 
     for src in sorted(src_dir.glob("*.md")):
         name = src.name
@@ -328,23 +380,25 @@ def install_commands(force: bool = False) -> Tuple[int, list[str]]:
             shutil.copy2(src, dst)
             installed += 1
         except OSError as e:
-            skipped.append(f"{dst}: {e}")
-    return installed, skipped
+            failed.append(f"{dst}: {e}")
+    return installed, skipped, failed
 
 
-def install_skills(force: bool = False) -> Tuple[int, list[str]]:
+def install_skills(force: bool = False) -> Tuple[int, list, list]:
     """Copy bundled skills into ~/.claude/skills/<skill-name>/SKILL.md.
 
     Each skill lives in its own directory (per Claude Code skill convention).
-    Returns (count_installed, list_of_skipped_paths).
+    Returns (count_installed, skipped, failed) — see install_commands() for
+    why a user-modified file (skipped) must not be treated as a failure.
     """
     src_dir = _packaged_skills_dir()
     if not src_dir.is_dir():
-        return 0, []
+        return 0, [], []
 
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     installed = 0
-    skipped: list[str] = []
+    skipped: list = []
+    failed: list = []
 
     for skill_dir in sorted(src_dir.iterdir()):
         if not skill_dir.is_dir():
@@ -368,8 +422,8 @@ def install_skills(force: bool = False) -> Tuple[int, list[str]]:
             shutil.copy2(src, dst)
             installed += 1
         except OSError as e:
-            skipped.append(f"{dst}: {e}")
-    return installed, skipped
+            failed.append(f"{dst}: {e}")
+    return installed, skipped, failed
 
 
 def run_setup(verbose: bool = True, install_cmds: bool = True, fast: bool = True) -> int:
@@ -396,26 +450,41 @@ def run_setup(verbose: bool = True, install_cmds: bool = True, fast: bool = True
 
     cmds_ok = True
     if install_cmds:
-        n, skipped = install_commands()
+        n, skipped, failed = install_commands()
+        # Compute status OUTSIDE the verbose blocks: the exit code must describe
+        # what happened, not how loudly we described it. (It used to be set only
+        # under `if verbose`, so the same run returned 0 quietly and 1 verbosely.)
+        # A user-modified file we deliberately left alone is not a failure —
+        # re-running install.sh, the documented upgrade path, hits that every
+        # time and used to print a spurious "cs --setup reported an issue".
+        cmds_ok = not failed
         if verbose:
             if n:
                 print(f"✓ Installed {n} slash command(s) to {COMMANDS_DIR}")
             if skipped:
-                cmds_ok = False
-                print(f"  Skipped (already exist with different content; use --force to overwrite):")
+                print(f"  Kept your edited version (use --force to overwrite):")
                 for s in skipped:
+                    print(f"    {s}")
+            if failed:
+                print(f"! Could not install:")
+                for s in failed:
                     print(f"    {s}")
             print("  Try /statusbar in Claude Code.")
 
         # Install the consolidated skill alongside the slash commands.
-        s_n, s_skipped = install_skills()
+        s_n, s_skipped, s_failed = install_skills()
+        if s_failed:
+            cmds_ok = False
         if verbose:
             if s_n:
                 print(f"✓ Installed {s_n} skill(s) to {SKILLS_DIR}")
             if s_skipped:
-                cmds_ok = False
-                print(f"  Skill skipped (use --force to overwrite):")
+                print(f"  Kept your edited skill (use --force to overwrite):")
                 for s in s_skipped:
+                    print(f"    {s}")
+            if s_failed:
+                print(f"! Could not install skill:")
+                for s in s_failed:
                     print(f"    {s}")
 
     if fast:

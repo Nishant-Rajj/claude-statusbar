@@ -56,17 +56,33 @@ _PKG_DIR = Path(__file__).resolve().parent
 
 
 def _pkg_mtime() -> float:
-    """Newest mtime among files in the installed package directory.
+    """Newest mtime of the installed code, whichever form it takes.
 
     Used to detect "running daemon is older than the code on disk" (i.e.
-    the user just upgraded via PyPI but the long-lived daemon is still
-    serving stale renders). One `os.scandir` per render tick — cheap.
-    Returns 0 on any I/O error so the freshness check degrades to its
-    pre-upgrade behavior rather than thrashing.
+    the user just upgraded but the long-lived daemon is still serving stale
+    renders). One `os.scandir` per render tick — cheap. Returns 0 on any I/O
+    error so the freshness check degrades to its pre-upgrade behavior rather
+    than thrashing.
+
+    Frozen (PyInstaller onefile) builds have no loose `.py` files to scan:
+    pure-Python modules live inside the PYZ archive, and the self-extracted
+    `_MEIxxxx` dir is recreated per run, so its mtimes are meaningless anyway.
+    Use the executable's own mtime there — re-running install.sh replaces the
+    binary, which is exactly the "installed code is newer than the daemon"
+    signal this function exists to provide. (Scanning it instead yielded an
+    empty `max()` → uncaught ValueError → every render crashed once a daemon
+    session was cached; issue #36.)
     """
+    if getattr(sys, "frozen", False):
+        try:
+            return os.stat(sys.executable).st_mtime
+        except OSError:
+            return 0.0
     try:
-        return max(e.stat().st_mtime for e in os.scandir(_PKG_DIR)
-                   if e.name.endswith(".py"))
+        # `default=` matters: a package dir with no .py files (frozen-like or
+        # exotic install layouts) must degrade to 0.0, not raise ValueError.
+        return max((e.stat().st_mtime for e in os.scandir(_PKG_DIR)
+                    if e.name.endswith(".py")), default=0.0)
     except OSError:
         return 0.0
 
@@ -98,15 +114,19 @@ def _is_fresh(meta: dict) -> bool:
         return False
     if delta > stale_after:
         return False
+    return not _is_outdated_daemon(meta)
+
+
+def _is_outdated_daemon(meta: dict) -> bool:
+    """True only when meta proves the daemon predates installed package code."""
     daemon_started_at = meta.get("daemon_started_at")
-    if daemon_started_at is not None:
-        try:
-            started = float(daemon_started_at)
-        except (TypeError, ValueError):
-            return True  # malformed field; ignore code-drift check
-        if _pkg_mtime() > started:
-            return False
-    return True
+    if daemon_started_at is None:
+        return False
+    try:
+        started = float(daemon_started_at)
+    except (TypeError, ValueError):
+        return False  # malformed field; ignore code-drift check
+    return _pkg_mtime() > started
 
 
 def _signal_outdated_daemon(meta: dict) -> None:
@@ -115,14 +135,21 @@ def _signal_outdated_daemon(meta: dict) -> None:
     serving stale renders and won't restart on its own (its pidfile is
     valid so lazy-spawn skips it). Best-effort — any error is silently
     swallowed; the worst case is a duplicate daemon for one render tick.
+
+    `meta["pid"]` can be arbitrarily old (a session's meta outlives the daemon
+    that wrote it), so the pid may have been recycled onto an unrelated user
+    process by now. Verify it is still our daemon before signalling.
     """
     pid = meta.get("pid")
     if not isinstance(pid, int) or pid <= 1:
         return
     try:
         import signal as _signal
+        from .daemon import _process_is_our_daemon
+        if not _process_is_our_daemon(pid):
+            return
         os.kill(pid, _signal.SIGTERM)
-    except (OSError, ProcessLookupError, PermissionError):
+    except (OSError, ProcessLookupError, PermissionError, ImportError):
         pass
 
 
@@ -156,7 +183,19 @@ def _displacement_suffix() -> str:
     cmd = sl.get("command")
     if not isinstance(cmd, str) or not cmd.strip():
         return ""
-    name = Path(cmd.strip().split()[0]).name
+    if "claude_statusbar" in cmd:
+        # `<python> -m claude_statusbar.cli render` — ours, just not via the
+        # console script. See setup._invokes_our_module.
+        return ""
+    # Split on both separators rather than via Path: a `C:\...\cs.EXE` entry
+    # must still reduce to its basename when this code runs on POSIX (CI, and
+    # a settings.json synced off a Windows box), where PosixPath keeps the
+    # whole backslash string as one `.name`.
+    name = cmd.strip().split()[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for _ext in (".exe", ".cmd", ".bat"):
+        if name.endswith(_ext):
+            name = name[: -len(_ext)]
+            break
     if name in _OUR_BINARY_NAMES:
         return ""
     # ANSI red. Kept short so it doesn't blow up the bar on narrow terminals.
@@ -173,6 +212,18 @@ def _append_suffix(content: str, suffix: str) -> str:
     return content + suffix
 
 
+_STDIN_CHUNK = 64 * 1024
+
+
+def _payload_is_complete(buf: bytearray) -> bool:
+    """True once `buf` holds a whole JSON document."""
+    try:
+        json.loads(buf.decode("utf-8", errors="replace"))
+    except ValueError:  # JSONDecodeError ⊂ ValueError
+        return False
+    return True
+
+
 def _consume_stdin() -> bytes | None:
     """Read Claude Code's stdin payload (bytes) and return it.
 
@@ -180,17 +231,40 @@ def _consume_stdin() -> bytes | None:
     for both (a) writing it to per-session + legacy last_stdin.json so the
     daemon sees it on the next tick, and (b) replaying it into sys.stdin
     if the inline fallback path needs to consume it.
+
+    Stops at the end of the JSON document rather than at EOF. `read()` waits
+    for *every* write handle on the pipe to close, which is not something the
+    client controls: Claude Code spawns the statusLine through a shell, and on
+    Windows a sibling process that inherited the write handle keeps the pipe
+    open after that shell exits. The payload has arrived in full, but read()
+    never returns and the process lives forever — observed as a steady drip of
+    `cs render` processes, parent gone, each still resident minutes later.
+
+    One extra json.loads per chunk; the payload is a couple of KB and arrives
+    in a single read, so this costs ~0.05ms on the render hot path.
     """
     try:
         if sys.stdin.isatty():
             return None
     except (OSError, ValueError):
         return None
+    data = bytearray()
     try:
-        data = sys.stdin.buffer.read()
+        # read1() returns what one raw read yields; read() would block until
+        # the buffer is full or EOF, which is the behaviour being avoided.
+        read_some = getattr(sys.stdin.buffer, "read1", None)
+        if read_some is None:  # exotic stdin replacement — keep the old path
+            return sys.stdin.buffer.read() or None
+        while True:
+            chunk = read_some(_STDIN_CHUNK)
+            if not chunk:
+                break  # EOF — the writer closed as expected
+            data += chunk
+            if _payload_is_complete(data):
+                break  # whole document in hand; don't wait on the pipe
     except (OSError, AttributeError):
         return None
-    return data or None
+    return bytes(data) or None
 
 
 def _extract_session_id(payload: bytes) -> str:
@@ -210,6 +284,43 @@ def _extract_session_id(payload: bytes) -> str:
     if not isinstance(sid, str) or not sid.strip():
         return "default"
     return sid
+
+
+# API-mode-relevant env vars. render_thin runs in the REAL session shell, but
+# the shared daemon's os.environ is frozen at its own start and is not this
+# session's — so no-quota detection there must read the session env, not the
+# daemon's. We stamp these into the payload the daemon consumes.
+_SESSION_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "CS_API_MODE",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+)
+
+
+def _inject_session_env(payload: bytes) -> bytes:
+    """Stamp this session's API-mode env vars into the payload under `_cs_env`.
+
+    The marker is always written (possibly with a subset / empty) when the
+    payload is a JSON object, so the daemon knows the signal came from the real
+    session env rather than its own frozen os.environ. Returns the payload
+    unchanged if it isn't a JSON object or re-serialisation fails."""
+    try:
+        d = json.loads(payload.decode("utf-8", errors="replace"))
+    except (ValueError, json.JSONDecodeError):
+        return payload
+    if not isinstance(d, dict):
+        return payload
+    env = {}
+    for k in _SESSION_ENV_KEYS:
+        v = os.environ.get(k)
+        if v:
+            env[k] = v
+    d["_cs_env"] = env
+    try:
+        return json.dumps(d).encode("utf-8")
+    except (TypeError, ValueError):
+        return payload
 
 
 def _atomic_write_bytes(target: Path, data: bytes) -> None:
@@ -247,12 +358,52 @@ def _persist_stdin_bytes(data: bytes, session_id: str) -> None:
     _atomic_write_bytes(_LEGACY_STDIN_CACHE, data)
 
 
+# Spawn debounce (issue #31): mtime of this marker = last spawn attempt.
+# Even if the daemon's pidfile lock is broken on some platform, the thin
+# client fires at most one spawn attempt per _SPAWN_DEBOUNCE_S — that's
+# what turned "every stale tick leaks a daemon" (Windows, ~150 orphans/day)
+# into a bounded, self-healing retry. Shared across sessions on purpose:
+# one daemon serves all windows.
+_SPAWN_MARKER = _CACHE_DIR / "daemon.spawn"
+_SPAWN_DEBOUNCE_S = 30.0
+
+
+def _spawn_recently_attempted() -> bool:
+    """True if a spawn attempt was recorded < _SPAWN_DEBOUNCE_S ago.
+
+    Future mtime (clock jumped backward) reads as NOT debounced — the next
+    attempt re-touches the marker, so skew self-heals instead of either
+    wedging spawns forever or suppressing them forever.
+    """
+    try:
+        age = time.time() - _SPAWN_MARKER.stat().st_mtime
+    except OSError:
+        return False
+    return 0 <= age < _SPAWN_DEBOUNCE_S
+
+
+def _record_spawn_attempt() -> None:
+    try:
+        _SPAWN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        _SPAWN_MARKER.touch()
+    except OSError:
+        pass
+
+
 def _spawn_daemon_async() -> None:
     """Best-effort spawn of cs daemon in a detached child process.
 
     Failures are silent — the user's status line already rendered via
     fallback, so we just want a daemon up for the *next* tick.
+
+    Debounced to one attempt per _SPAWN_DEBOUNCE_S so a broken/unavailable
+    pidfile lock can't leak unbounded daemon processes (issue #31). Worst
+    case cost of the debounce: up to 30s of inline-rendered (still correct)
+    ticks after a daemon dies before the respawn retry.
     """
+    if _spawn_recently_attempted():
+        return
+    _record_spawn_attempt()
     try:
         # Lazy import — only the fallback path pays for daemon.py.
         from .daemon import spawn_if_dead
@@ -293,7 +444,9 @@ def render() -> int:
     session_id = "default"
     if payload is not None:
         session_id = _extract_session_id(payload)
-        _persist_stdin_bytes(payload, session_id)
+        # Stamp the session env BEFORE persisting so the daemon (frozen env)
+        # detects no-quota mode per session, not from its own start-time env.
+        _persist_stdin_bytes(_inject_session_env(payload), session_id)
 
     # Fast path: if THIS session's daemon-rendered output is fresh, cat
     # the file and return. No core/styles/themes import.
@@ -309,17 +462,24 @@ def render() -> int:
             # Fall through to inline.
             pass
 
-    # If the meta is stale because the daemon is running outdated code
-    # (PyPI upgrade while daemon kept running), nudge it to exit so the
-    # spawn below can bring up a fresh process. Old daemon's pidfile is
-    # still valid otherwise and `_spawn_daemon_async` would refuse.
-    if meta is not None:
+    # If the meta is stale because the daemon is running outdated code (PyPI
+    # upgrade while the daemon kept running), nudge it to exit. Do not signal
+    # on ordinary age-stale output; a slow shared daemon would otherwise get
+    # killed by every session it has not reached yet.
+    #
+    # Crucially, do NOT try to spawn on this same tick. The old daemon is still
+    # alive for the moment it takes to handle SIGTERM, so `spawn_if_dead` would
+    # find a valid pidfile and refuse — while `_spawn_daemon_async` had already
+    # burned the 30s spawn debounce. That left every session inline-rendering
+    # for 30s after an upgrade. Skip the spawn and let the next tick (~1s) do
+    # it, once the old daemon has dropped its pidfile.
+    if meta is not None and _is_outdated_daemon(meta):
         _signal_outdated_daemon(meta)
-
-    # Fallback: render inline AND kick off a daemon spawn so the next
-    # tick is fast. We don't wait for the daemon to come up — the user's
-    # status line shows the inline-rendered string this tick.
-    _spawn_daemon_async()
+    else:
+        # Fallback: render inline AND kick off a daemon spawn so the next
+        # tick is fast. We don't wait for the daemon to come up — the user's
+        # status line shows the inline-rendered string this tick.
+        _spawn_daemon_async()
     if payload is not None:
         # core.main() reads sys.stdin via parse_stdin_data(); replay the
         # bytes we already consumed so it sees the same payload Claude Code

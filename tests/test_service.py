@@ -47,7 +47,7 @@ def test_systemd_unit_structure():
     assert "[Install]" in body
     assert "ExecStart=/usr/local/bin/cs daemon _run" in body
     # Must auto-restart on crash.
-    assert "Restart=always" in body
+    assert "Restart=on-failure" in body
     # WantedBy=default.target so it runs at user-login under systemd.
     assert "WantedBy=default.target" in body
 
@@ -108,3 +108,29 @@ def test_uninstall_idempotent_when_nothing_installed(monkeypatch, tmp_path: Path
         pytest.skip(f"unsupported platform {sys.platform!r}")
     assert ok is True
     assert "nothing to remove" in msg.lower()
+
+
+def test_launchd_keepalive_only_bounces_crashes():
+    """Plain `KeepAlive=true` restarts the job on ANY exit, so launchd's own
+    instance — which exits cleanly when the lazy-spawned daemon already holds
+    the pidfile — was relaunched every ThrottleInterval, forever. One user's
+    daemon.stderr.log had 47429 `daemon already running` lines.
+    """
+    from claude_statusbar.service import _build_launchd_plist
+    body = _build_launchd_plist("/usr/local/bin/cs")
+    assert "<key>KeepAlive</key>" in body
+    keepalive = body.split("<key>KeepAlive</key>", 1)[1]
+    assert "<key>SuccessfulExit</key>" in keepalive.split("</dict>", 1)[0]
+    assert "<false/>" in keepalive.split("</dict>", 1)[0]
+    # A bare <true/> immediately after the key is exactly the bug.
+    assert not keepalive.lstrip().startswith("<true/>")
+
+
+def test_systemd_restart_only_on_failure():
+    """Same class of bug as the launchd KeepAlive one: `Restart=always`
+    relaunches even a clean exit, so systemd's instance looped every
+    RestartSec whenever a lazy-spawned daemon held the pidfile, and
+    `cs daemon stop` never stuck (clean exit, immediately relaunched)."""
+    body = service._build_systemd_unit("/usr/local/bin/cs")
+    assert "Restart=on-failure" in body
+    assert "Restart=always" not in body

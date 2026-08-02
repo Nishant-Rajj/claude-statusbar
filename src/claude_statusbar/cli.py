@@ -12,6 +12,21 @@ import os
 import argparse
 
 
+VERSION_FLAGS = ("--version", "-V", "-v", "-version")
+SUBCOMMANDS = (
+    "config",
+    "themes",
+    "styles",
+    "preview",
+    "install-commands",
+    "install-skill",
+    "doctor",
+    "daemon",
+    "upgrade",
+    "hud",
+)
+
+
 def _run_config_subcommand(rest):
     """Handle `cs config <action> [args...]`. Returns exit code."""
     from . import config as cfg_mod
@@ -29,8 +44,11 @@ def _run_config_subcommand(rest):
         print(f"show_weekly         = {cfg.show_weekly}")
         print(f"show_language       = {cfg.show_language}")
         print(f"show_cost           = {cfg.show_cost}")
+        print(f"show_balance        = {cfg.show_balance}")
+        print(f"balance_bar         = {cfg.balance_bar}")
         print(f"show_cache_age      = {cfg.show_cache_age}")
         print(f"show_project_branch = {cfg.show_project_branch}")
+        print(f"show_party          = {cfg.show_party}")
         print(f"show_ahead_behind   = {cfg.show_ahead_behind}")
         print(f"show_todos          = {cfg.show_todos}")
         print(f"show_tools          = {cfg.show_tools}")
@@ -38,7 +56,12 @@ def _run_config_subcommand(rest):
         print(f"show_agents         = {cfg.show_agents}")
         print(f"show_duration       = {cfg.show_duration}")
         print(f"show_lines          = {cfg.show_lines}")
+        print(f"show_version        = {cfg.show_version}")
+        print(f"show_mode           = {cfg.show_mode}")
+        print(f"mode_gradient       = {cfg.mode_gradient}")
         print(f"bar_shimmer         = {cfg.bar_shimmer}")
+        print(f"show_forecast       = {cfg.show_forecast}")
+        print(f"show_projection     = {cfg.show_projection}")
         print(f"cache_ttl_seconds   = {cfg.cache_ttl_seconds}")
         print(f"warning_threshold   = {cfg.warning_threshold}")
         print(f"critical_threshold  = {cfg.critical_threshold}")
@@ -166,6 +189,123 @@ def _run_daemon_subcommand(rest):
     return 2
 
 
+def _run_upgrade_subcommand():
+    """Handle `cs upgrade`. Returns exit code."""
+    from .updater import upgrade_current_install
+    ok, message = upgrade_current_install()
+    print(message)
+    return 0 if ok else 1
+
+
+HUD_LABEL = "com.leeguoo.claude-statusbar-hud"
+
+
+def _hud_plist_path():
+    from pathlib import Path
+    return Path.home() / "Library/LaunchAgents" / f"{HUD_LABEL}.plist"
+
+
+def _hud_program_args():
+    # launchd's plist must point at an executable that can actually import the
+    # HUD (pyobjc). Two cases:
+    #  - standalone binary: it *is* the cs executable and on macOS bundles the
+    #    HUD, so sys.executable is exactly what we want.
+    #  - pip/venv install: prefer *this* interpreter (whoever ran `hud install`
+    #    has pyobjc), not which("cs") — a pyobjc-less binary could sit ahead of
+    #    it on PATH and get picked wrongly.
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "hud", "start"]
+    return [sys.executable, "-m", "claude_statusbar.cli", "hud", "start"]
+
+
+def _hud_install():
+    from pathlib import Path
+    import subprocess
+    plist = _hud_plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    log = str(Path.home() / ".claude" / "claude-statusbar-hud.log")
+    args = "".join(f"    <string>{a}</string>\n" for a in _hud_program_args())
+    plist.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n<dict>\n'
+        f'  <key>Label</key><string>{HUD_LABEL}</string>\n'
+        f'  <key>ProgramArguments</key>\n  <array>\n{args}  </array>\n'
+        '  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n'
+        f'  <key>StandardErrorPath</key><string>{log}</string>\n'
+        f'  <key>StandardOutPath</key><string>{log}</string>\n'
+        '</dict>\n</plist>\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", str(plist)], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"launchctl load failed: {r.stderr.strip()}", file=sys.stderr)
+        return 1
+    print(f"HUD service installed — starts on login, restarts on crash\n  plist: {plist}")
+    return 0
+
+
+def _hud_uninstall():
+    import subprocess
+    plist = _hud_plist_path()
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    if plist.exists():
+        plist.unlink()
+    subprocess.run(["pkill", "-f", "claude_statusbar.cli hud"], capture_output=True)
+    print("HUD service uninstalled")
+    return 0
+
+
+def _hud_stop():
+    import subprocess
+    subprocess.run(["launchctl", "stop", HUD_LABEL], capture_output=True)
+    subprocess.run(["pkill", "-f", "claude_statusbar.cli hud"], capture_output=True)
+    print("HUD stopped (launchd will restart it if installed — use `cs hud uninstall` to remove for good)")
+    return 0
+
+
+def _run_hud_subcommand(rest):
+    """`cs hud [start|install|uninstall|stop]` — floating desktop HUD (macOS)."""
+    if sys.platform != "darwin":
+        print("cs hud is macOS-only", file=sys.stderr)
+        return 2
+    action = rest[0] if rest else "start"
+    if action == "install":
+        return _hud_install()
+    if action == "uninstall":
+        return _hud_uninstall()
+    if action == "stop":
+        return _hud_stop()
+    if action == "check":
+        # Non-GUI import check: verifies pyobjc + the HUD modules are present
+        # (used by CI to smoke-test that the binary bundled the HUD).
+        try:
+            import objc, AppKit, Quartz, Foundation  # noqa: F401
+            from . import hud  # noqa: F401
+        except Exception as e:
+            print(f"HUD import failed: {e}", file=sys.stderr)
+            return 1
+        print("HUD OK (pyobjc bundled)")
+        return 0
+    if action in ("start", "run"):
+        try:
+            from . import hud
+        except ImportError as e:
+            print(
+                f"missing GUI dependency (pyobjc): {e}\n"
+                "install: pip install 'claude-statusbar[hud]'\n"
+                "or:      pip install pyobjc-framework-Cocoa pyobjc-framework-Quartz",
+                file=sys.stderr,
+            )
+            return 1
+        hud.run(rest[1:])
+        return 0
+    print(f"unknown hud action: {action} (expected start/install/uninstall/stop)", file=sys.stderr)
+    return 2
+
+
 def main():
     """Main CLI entry point"""
     # Render fast-path: `cs render` is what Claude Code calls 60×/min when
@@ -177,11 +317,15 @@ def main():
         return render()
 
     # Subcommands hijack argv before argparse so they coexist with flags.
-    if len(sys.argv) >= 2 and sys.argv[1] in ("config", "themes", "styles", "preview", "install-commands", "install-skill", "doctor", "daemon"):
+    if len(sys.argv) >= 2 and sys.argv[1] in SUBCOMMANDS:
         sub = sys.argv[1]
         rest = sys.argv[2:]
+        if sub == "hud":
+            return _run_hud_subcommand(rest)
         if sub == "daemon":
             return _run_daemon_subcommand(rest)
+        if sub == "upgrade":
+            return _run_upgrade_subcommand()
         if sub == "config":
             return _run_config_subcommand(rest)
         if sub == "themes":
@@ -242,32 +386,44 @@ def main():
         if sub == "install-commands":
             from .setup import install_commands, install_skills, COMMANDS_DIR, SKILLS_DIR
             force = "--force" in rest
-            n, skipped = install_commands(force=force)
+            n, skipped, failed = install_commands(force=force)
             print(f"Installed {n} slash command(s) to {COMMANDS_DIR}")
             if skipped:
-                print("Skipped:")
+                print("Kept your edited version:")
                 for s in skipped:
                     print(f"  {s}")
                 print("Use `cs install-commands --force` to overwrite.")
-            s_n, s_skipped = install_skills(force=force)
+            if failed:
+                print("Could not install:")
+                for s in failed:
+                    print(f"  {s}")
+            s_n, s_skipped, s_failed = install_skills(force=force)
             if s_n:
                 print(f"Installed {s_n} skill(s) to {SKILLS_DIR}")
             if s_skipped:
-                print("Skill skipped:")
+                print("Kept your edited skill:")
                 for s in s_skipped:
+                    print(f"  {s}")
+            if s_failed:
+                print("Could not install skill:")
+                for s in s_failed:
                     print(f"  {s}")
             print("Try /statusbar in Claude Code, or just say `switch theme to nord`.")
             return 0
         if sub == "install-skill":
             from .setup import install_skills, SKILLS_DIR
             force = "--force" in rest
-            n, skipped = install_skills(force=force)
+            n, skipped, failed = install_skills(force=force)
             print(f"Installed {n} skill(s) to {SKILLS_DIR}")
             if skipped:
-                print("Skipped:")
+                print("Kept your edited version:")
                 for s in skipped:
                     print(f"  {s}")
                 print("Use `cs install-skill --force` to overwrite.")
+            if failed:
+                print("Could not install:")
+                for s in failed:
+                    print(f"  {s}")
             print("Try saying `switch theme to nord` in Claude Code.")
             return 0
 
@@ -286,6 +442,7 @@ Examples:
   cs styles                     # List available styles
   cs preview                    # Render every style × theme together
   cs install-commands           # Install /statusbar slash commands
+  cs upgrade                    # Upgrade this cs installation
   cs --json-output              # Machine-readable JSON
 
 Integration:
@@ -296,11 +453,17 @@ Integration:
 
     # `from . import __version__` triggers importlib.metadata, which pulls
     # email.message + zipfile + ~20ms of cumulative imports on every render.
-    # Only register the action when the user actually asked for --version.
-    if "--version" in sys.argv[1:]:
+    # Only register the action when the user actually asked for a version.
+    if any(flag in sys.argv[1:] for flag in VERSION_FLAGS):
         from . import __version__ as _ver
+        # Derive the program name from argv[0] ourselves rather than argparse's
+        # %(prog)s: Python 3.14's argparse rewrites prog to "python3.x -m module"
+        # (via sys.orig_argv) when launched with -m, which ignores argv[0]. Using
+        # basename(argv[0]) keeps the real exe name (cs / cstatus / claude-statusbar)
+        # on every Python version.
+        prog = os.path.basename(sys.argv[0]) or "cs"
         parser.add_argument(
-            "--version", action="version", version=f"%(prog)s {_ver}"
+            *VERSION_FLAGS, action="version", version=f"{prog} {_ver}"
         )
 
     parser.add_argument(
@@ -488,19 +651,28 @@ Integration:
 
     # Run the status bar
     use_color = not (args.no_color or no_color_env)
-    from .progress import normalize_thresholds  # heavy: pulls in all of progress
-    try:
-        warning_threshold, critical_threshold = normalize_thresholds(
-            args.warning_threshold
-            if args.warning_threshold is not None
-            else env_float("CLAUDE_STATUSBAR_WARNING_THRESHOLD"),
-            args.critical_threshold
-            if args.critical_threshold is not None
-            else env_float("CLAUDE_STATUSBAR_CRITICAL_THRESHOLD"),
-        )
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    # Resolve CLI flag > env, leaving None when neither is set so core.main()
+    # falls through to the persisted config value (CLI > env > config > default).
+    # Passing a normalized 30/70 here would shadow `cs config set`.
+    warning_threshold = (
+        args.warning_threshold
+        if args.warning_threshold is not None
+        else env_float("CLAUDE_STATUSBAR_WARNING_THRESHOLD")
+    )
+    critical_threshold = (
+        args.critical_threshold
+        if args.critical_threshold is not None
+        else env_float("CLAUDE_STATUSBAR_CRITICAL_THRESHOLD")
+    )
+    if warning_threshold is not None or critical_threshold is not None:
+        # Validate only when the user actually supplied a flag/env, so a bad
+        # explicit value still errors loudly instead of silently resetting.
+        from .progress import normalize_thresholds
+        try:
+            normalize_thresholds(warning_threshold, critical_threshold)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     try:
         # Pull in the heavy render path only now (after we've definitely

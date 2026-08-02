@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-statusbar"
-version = "3.9.1"
+version = "3.32.3"
 authors = [
     {name = "leeguooooo", email = "leeguooooo@gmail.com"}
 ]
@@ -33,6 +33,11 @@ dependencies = []
 full = [
     "claude-monitor>=3.0.0",
 ]
+# Desktop floating HUD (macOS only): `cs hud`. Requires PyObjC.
+hud = [
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+]
 
 [project.urls]
 
@@ -46,3 +51,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 claude_statusbar = ["*.py", "commands/*.md", "skills/**/*.md"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]

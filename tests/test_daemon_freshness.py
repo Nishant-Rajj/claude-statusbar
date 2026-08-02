@@ -4,6 +4,7 @@ re-spawn) so a PyPI auto-upgrade actually reaches the user."""
 import json
 import os
 import signal
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -11,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 
-from claude_statusbar import render_thin
+from claude_statusbar import daemon, render_thin
 from claude_statusbar.daemon import session_meta_path, session_rendered_path
 
 
@@ -77,10 +78,10 @@ def test_meta_without_daemon_started_at_falls_back_to_age_check(monkeypatch):
 def test_outdated_daemon_signals_pid_to_exit(tmp_path, monkeypatch):
     """When the thin client decides the daemon is outdated, it should
     send SIGTERM to the pid recorded in the meta so launchd / lazy-spawn
-    can bring up a fresh one. The pidfile-check guard prevents signalling
-    an unrelated process if the pid got reused."""
+    can bring up a fresh one."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(render_thin, "_pkg_mtime", lambda: time.time())
+    monkeypatch.setattr(daemon, "_process_is_our_daemon", lambda pid: True)
     meta = {
         "generated_at": time.time(),
         "stale_after_seconds": 5.0,
@@ -92,10 +93,68 @@ def test_outdated_daemon_signals_pid_to_exit(tmp_path, monkeypatch):
     kill.assert_called_once_with(99999, signal.SIGTERM)
 
 
+def test_recycled_pid_is_never_signalled(monkeypatch):
+    """A session's meta outlives the daemon that wrote it, so meta["pid"] can
+    point at an unrelated user process by the time we read it. Never SIGTERM
+    a pid that is no longer our daemon."""
+    monkeypatch.setattr(daemon, "_process_is_our_daemon", lambda pid: False)
+    with patch("os.kill") as kill:
+        render_thin._signal_outdated_daemon({"pid": 99999})
+    kill.assert_not_called()
+
+
 def test_signal_outdated_daemon_swallows_errors(monkeypatch):
     """Pid may have died already; signalling should never raise."""
-    meta = {"pid": 1}
+    monkeypatch.setattr(daemon, "_process_is_our_daemon", lambda pid: True)
+    meta = {"pid": 99999}
     def _raise(*_):
         raise ProcessLookupError
     monkeypatch.setattr("os.kill", _raise)
     render_thin._signal_outdated_daemon(meta)  # must not raise
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #36: standalone PyInstaller binary crashed on every render once a
+# daemon session was cached. `_pkg_mtime()` scanned the package dir for `.py`
+# files; a frozen onefile build has none (modules live in the PYZ archive), so
+# `max()` got an empty iterable and raised ValueError — which `except OSError`
+# did not catch. Uncaught → statusline died on every tick.
+# ---------------------------------------------------------------------------
+def test_pkg_mtime_survives_package_dir_without_py_files(tmp_path, monkeypatch):
+    """No .py files on disk must degrade to 0.0, never raise."""
+    monkeypatch.setattr(render_thin, "_PKG_DIR", tmp_path)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert render_thin._pkg_mtime() == 0.0
+
+
+def test_is_outdated_daemon_does_not_raise_without_py_files(tmp_path, monkeypatch):
+    """The exact crash path from the report: cached meta carrying
+    `daemon_started_at` + a package dir with no .py files."""
+    monkeypatch.setattr(render_thin, "_PKG_DIR", tmp_path)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert render_thin._is_outdated_daemon({"daemon_started_at": 1.0}) is False
+
+
+def test_frozen_build_uses_executable_mtime(tmp_path, monkeypatch):
+    """Frozen binaries have no loose .py files, but the staleness feature must
+    still work: re-running install.sh swaps the binary, so its mtime is the
+    'installed code version'."""
+    exe = tmp_path / "cs"
+    exe.write_text("binary", encoding="utf-8")
+    os.utime(exe, (1_000_000, 1_000_000))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    assert render_thin._pkg_mtime() == 1_000_000
+
+    # A daemon started before that binary was installed is outdated...
+    assert render_thin._is_outdated_daemon({"daemon_started_at": 999_999}) is True
+    # ...and one started after it is not.
+    assert render_thin._is_outdated_daemon({"daemon_started_at": 1_000_001}) is False
+
+
+def test_frozen_build_with_missing_executable_degrades(tmp_path, monkeypatch):
+    """stat() on a vanished/inaccessible binary must degrade, not raise."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "gone"))
+    assert render_thin._pkg_mtime() == 0.0

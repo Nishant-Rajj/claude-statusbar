@@ -15,6 +15,59 @@ from .themes import Theme, get_theme
 RESET = "\033[0m"
 BOLD  = "\033[1m"
 ITAL  = "\033[3m"
+FAINT = "\033[2m"   # dim/faint attribute — makes a grey recede even further
+
+# Installed version, resolved once and cached. importlib.metadata is ~20ms and
+# banned on the per-render import graph, but a lazy call here (only when the
+# version segment is on) is fine: it's not an import-time edge, and the daemon
+# pays it once per process. Empty string if it can't be determined.
+_VERSION_CACHE = None
+def _statusbar_version() -> str:
+    global _VERSION_CACHE
+    if _VERSION_CACHE is None:
+        try:
+            import importlib.metadata as _m
+            _VERSION_CACHE = _m.version("claude-statusbar")
+        except Exception:
+            _VERSION_CACHE = ""
+    return _VERSION_CACHE
+
+
+def _version_gt(a: str, b: str) -> bool:
+    """True if dotted version `a` is newer than `b`. Fail-safe (bad parts → 0)."""
+    def parts(v):
+        out = []
+        for x in str(v).split("."):
+            try:
+                out.append(int(x))
+            except ValueError:
+                out.append(0)
+        return out
+    pa, pb = parts(a), parts(b)
+    n = max(len(pa), len(pb))
+    pa += [0] * (n - len(pa))
+    pb += [0] * (n - len(pb))
+    return pa > pb
+
+
+def _update_hint(path=None) -> str:
+    """The newer version string if the cached PyPI check says one is available
+    (and the check is recent), else ''. Cheap file read — no network, no
+    importlib on the hot path. Written by updater.get_latest_version."""
+    try:
+        import json as _json
+        import time as _t
+        from pathlib import Path as _Path
+        p = _Path(path) if path is not None else (
+            _Path.home() / ".cache" / "claude-statusbar" / "latest_version.json")
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        latest = str(data.get("version", ""))
+        checked_at = float(data.get("checked_at", 0))
+        if not latest or _t.time() - checked_at > 7 * 86400:  # stale → no arrow
+            return ""
+        return latest if _version_gt(latest, _statusbar_version()) else ""
+    except Exception:
+        return ""
 
 def _fg(rgb): return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
 def _bg(rgb): return f"\033[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
@@ -23,6 +76,10 @@ def _bg(rgb): return f"\033[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
 import re as _re
 _ANSI_RE = _re.compile(r"\033\[[0-9;]*m")
 def _strip(s: str) -> str: return _ANSI_RE.sub("", s)
+
+
+def _attr(obj, name: str, default=""):
+    return getattr(obj, name, default)
 
 # Density → padding string, shared by all renderers that support it.
 DENSITY_PAD = {"compact": "", "regular": " ", "cozy": "  "}
@@ -67,8 +124,13 @@ def render_capsule(
     density: str = "regular",
     show_weekly: bool = True,
     ctx_pct: Optional[float] = None,
+    projection_5h: str = "",
+    projection_7d: str = "",
+    no_quota: bool = False,
+    balance_text: str = "",
     **_ignored,
 ) -> str:
+    from .progress import window_severity_rgb
     theme = theme or get_theme("graphite")
     INK    = _fg(theme.pill_ink)
     EDGE   = _fg(theme.edge)
@@ -79,11 +141,13 @@ def render_capsule(
     def pill(bg_rgb, body):
         return f"{_bg(bg_rgb)}{INK}{pad}{body}{pad}{RESET}"
 
-    def sev_dot(p):
-        if p is None:
+    def sev_dot(p, chip=""):
+        # 5h/7d follow the projection; ctx_pct (no chip) stays current-usage.
+        rgb = window_severity_rgb(p, chip, theme,
+                                  warning_threshold, critical_threshold)
+        if rgb is None:
             return ""
-        col = _severity_color(theme, p, warning_threshold, critical_threshold)
-        return f" {_fg(col)}●{RESET}"
+        return f" {_fg(rgb)}●{RESET}"
 
     def pct_text(p):
         return "--%" if p is None else f"{int(round(p))}%"
@@ -92,22 +156,50 @@ def render_capsule(
 
     parts = []
 
-    five_body = (
-        f"{BOLD}◷ 5H{RESET}{INK}{_bg(theme.pill_5h)} {pct_text(msgs_pct)} "
-        f"· {reset_5h}{sev_dot(msgs_pct)}{INK}{_bg(theme.pill_5h)}"
-    )
-    parts.append(pill(theme.pill_5h, five_body))
-
-    if show_weekly:
-        week_body = (
-            f"{BOLD}☷ 7D{RESET}{INK}{_bg(theme.pill_7d)} {pct_text(weekly_pct)} "
-            f"· {reset_7d or '--'}{sev_dot(weekly_pct)}{INK}{_bg(theme.pill_7d)}"
+    if no_quota:
+        # No official quota: a single CTX pill replaces the 5H/7D pills,
+        # colored on context thresholds (claude-hud's 70/85), not the comfort band.
+        from .progress import (CONTEXT_WARNING_THRESHOLD as _CW,
+                               CONTEXT_CRITICAL_THRESHOLD as _CC)
+        ctx_rgb = _severity_color(theme, ctx_pct, _CW, _CC)
+        ctx_dot = f" {_fg(ctx_rgb)}●{RESET}" if ctx_pct is not None else ""
+        ctx_body = (
+            f"{BOLD}⛁ CTX{RESET}{INK}{_bg(theme.pill_5h)} {pct_text(ctx_pct)}"
+            f"{ctx_dot}{INK}{_bg(theme.pill_5h)}"
         )
-        parts.append(pill(theme.pill_7d, week_body))
+        parts.append(pill(theme.pill_5h, ctx_body))
+    else:
+        five_body = (
+            f"{BOLD}◷ 5H{RESET}{INK}{_bg(theme.pill_5h)} {pct_text(msgs_pct)} "
+            f"· {reset_5h}{sev_dot(msgs_pct, projection_5h)}{INK}{_bg(theme.pill_5h)}"
+        )
+        parts.append(pill(theme.pill_5h, five_body))
 
-    model_body = f"{BOLD}◆{RESET}{INK}{_bg(theme.pill_model)} {model}{sev_dot(ctx_pct)}{INK}{_bg(theme.pill_model)}"
+        if show_weekly:
+            week_body = (
+                f"{BOLD}☷ 7D{RESET}{INK}{_bg(theme.pill_7d)} {pct_text(weekly_pct)} "
+                f"· {reset_7d or '--'}{sev_dot(weekly_pct, projection_7d)}{INK}{_bg(theme.pill_7d)}"
+            )
+            parts.append(pill(theme.pill_7d, week_body))
+
+    # In no_quota mode the CTX pill already carries the context severity, so the
+    # model pill stays neutral (no second ctx dot). In quota mode the model dot
+    # reflects context fill and must use the context band (70/85), not the 5h/7d
+    # comfort band — otherwise ~35% context shows a yellow dot here while the
+    # no-quota CTX pill reads green for the identical 35%.
+    if no_quota:
+        model_sev = ""
+    else:
+        from .progress import (window_severity_rgb as _wsr,
+                               CONTEXT_WARNING_THRESHOLD as _CW,
+                               CONTEXT_CRITICAL_THRESHOLD as _CC)
+        _ctx_rgb = _wsr(ctx_pct, "", theme, _CW, _CC)
+        model_sev = f" {_fg(_ctx_rgb)}●{RESET}" if _ctx_rgb is not None else ""
+    model_body = f"{BOLD}◆{RESET}{INK}{_bg(theme.pill_model)} {model}{model_sev}{INK}{_bg(theme.pill_model)}"
     parts.append(pill(theme.pill_model, model_body))
 
+    if balance_text:
+        parts.append(pill(theme.pill_cost, balance_text))
     if cost_text:
         parts.append(pill(theme.pill_cost, f"$ {cost_text}"))
 
@@ -139,14 +231,19 @@ def render_hairline(
     density: str = "regular",
     show_weekly: bool = True,
     ctx_pct: Optional[float] = None,
+    projection_5h: str = "",
+    projection_7d: str = "",
+    no_quota: bool = False,
+    balance_text: str = "",
     **_ignored,
 ) -> str:
+    from .progress import window_severity_rgb
     theme = theme or get_theme("graphite")
     INK  = _fg(theme.ink)
     MUTE = _fg(theme.mute)
     EDGE = _fg(theme.edge)
 
-    def mini3(p):
+    def mini3(p, chip="", warn=None, crit=None):
         if p is None:
             return f"{MUTE}···{RESET}"
         cells = []
@@ -156,7 +253,11 @@ def render_hairline(
             elif p >= slot - (100 / 3) * 0.66: cells.append("▆")
             elif p >= slot - (100 / 3):       cells.append("▃")
             else:                             cells.append("▁")
-        col = _severity_color(theme, p, warning_threshold, critical_threshold)
+        # Cells still reflect current usage; only the color follows projection.
+        rgb = window_severity_rgb(p, chip, theme,
+                                  warn if warn is not None else warning_threshold,
+                                  crit if crit is not None else critical_threshold)
+        col = rgb if rgb is not None else theme.mute
         return f"{_fg(col)}{''.join(cells)}{RESET}"
 
     def pct_text(p):
@@ -166,23 +267,41 @@ def render_hairline(
     sep = f"{sep_pad}{EDGE}┊{RESET}{sep_pad}"
     parts = []
 
-    parts.append(
-        f"{MUTE}› 5h{RESET} {mini3(msgs_pct)} {INK}{pct_text(msgs_pct)}{RESET} "
-        f"{MUTE}↺ {reset_5h}{RESET}"
-    )
-    if show_weekly:
+    if no_quota:
+        # No official quota: a single ctx mini-bar replaces the 5h/7d segments,
+        # colored on context thresholds (claude-hud's 70/85).
+        from .progress import (CONTEXT_WARNING_THRESHOLD as _CW,
+                               CONTEXT_CRITICAL_THRESHOLD as _CC)
         parts.append(
-            f"{MUTE}› 7d{RESET} {mini3(weekly_pct)} {INK}{pct_text(weekly_pct)}{RESET} "
-            f"{MUTE}↺ {reset_7d or '--'}{RESET}"
+            f"{MUTE}› ctx{RESET} {mini3(ctx_pct, warn=_CW, crit=_CC)} "
+            f"{INK}{pct_text(ctx_pct)}{RESET}"
         )
-    # Model line — colored by ctx_pct severity, neutral ink when absent
-    if ctx_pct is None:
+    else:
+        parts.append(
+            f"{MUTE}› 5h{RESET} {mini3(msgs_pct, projection_5h)} {INK}{pct_text(msgs_pct)}{RESET} "
+            f"{MUTE}↺ {reset_5h}{RESET}"
+        )
+        if show_weekly:
+            parts.append(
+                f"{MUTE}› 7d{RESET} {mini3(weekly_pct, projection_7d)} {INK}{pct_text(weekly_pct)}{RESET} "
+                f"{MUTE}↺ {reset_7d or '--'}{RESET}"
+            )
+    # Model line — colored by ctx_pct severity, neutral ink when absent. In
+    # no_quota mode the ctx mini-bar already carries severity, so stay neutral.
+    if ctx_pct is None or no_quota:
         model_color = INK
     else:
-        col = _severity_color(theme, ctx_pct, warning_threshold, critical_threshold)
+        # Context fill uses the context band (70/85), not the 5h/7d comfort
+        # band — consistent with the no_quota ctx mini-bar above and the other
+        # styles. ~35% context must read calm, not warning.
+        from .progress import (CONTEXT_WARNING_THRESHOLD as _CW,
+                               CONTEXT_CRITICAL_THRESHOLD as _CC)
+        col = _severity_color(theme, ctx_pct, _CW, _CC)
         model_color = _fg(col)
     parts.append(f"{MUTE}›{RESET} {model_color}{model}{RESET}")
 
+    if balance_text:
+        parts.append(f"{_fg(theme.s_ok)}{balance_text}{RESET}")
     if cost_text:
         parts.append(f"{MUTE}$ {INK}{cost_text}{RESET}")
 
@@ -213,6 +332,15 @@ def render_classic(
     countdown_emoji: str = "",
     ctx_pct: Optional[float] = None,
     shimmer_phase=None,
+    projection_5h: str = "",
+    projection_7d: str = "",
+    forecast_5h: str = "",
+    forecast_7d: str = "",
+    no_quota: bool = False,
+    balance_text: str = "",
+    balance_pct=None,
+    balance_amount: str = "",
+    quota_stale: bool = False,
     **_ignored,
 ) -> str:
     from .progress import format_status_line, _fg, colorize, RESET
@@ -234,6 +362,15 @@ def render_classic(
         cost_text=cost_text,
         theme=theme,
         shimmer_phase=shimmer_phase,
+        projection_5h=projection_5h,
+        projection_7d=projection_7d,
+        forecast_5h=forecast_5h,
+        forecast_7d=forecast_7d,
+        no_quota=no_quota,
+        balance_text=balance_text,
+        balance_pct=balance_pct,
+        balance_amount=balance_amount,
+        quota_stale=quota_stale,
     )
     if cache_age_text:
         # Three-level severity: COLD red, <1m yellow, otherwise green.
@@ -295,6 +432,8 @@ def _stats_segment(duration_text: str, lines_text: str, *, theme: Theme,
 def render_identity_line(info, *, theme: Theme, dirty,
                          ahead=None, behind=None,
                          duration_text: str = "", lines_text: str = "",
+                         version_text: str = "", update_text: str = "",
+                         cwd_text: str = "",
                          use_color: bool = True) -> str:
     """Render the 2nd line: `⤷ <project> ⎇ <branch>●↑2↓1 · ⏱ <dur> · +/-lines`.
 
@@ -307,6 +446,10 @@ def render_identity_line(info, *, theme: Theme, dirty,
     linked git worktree (`info.is_worktree`), a bare ``[worktree]`` marker is
     appended after the branch — a boolean signal only; the branch already
     says which worktree it is, so the name isn't repeated.
+
+    `cwd_text` (show_cwd, #30) is the session's working directory; it's
+    appended after the branch only when it adds information — skipped when it
+    equals the project name (cwd at the repo root would just repeat the anchor).
     """
     ab = _ahead_behind_glyphs(ahead, behind) if info.in_git else ""
     stats = _stats_segment(duration_text, lines_text, theme=theme,
@@ -324,14 +467,21 @@ def render_identity_line(info, *, theme: Theme, dirty,
                 tail += f" {ab}"
         if info.is_worktree:
             tail += " [worktree]"
-        return head + tail + stats
+        if cwd_text and cwd_text != info.project_name:
+            tail += f" · {cwd_text}"
+        ver = f" · v{version_text}" if version_text else ""
+        if version_text and update_text:
+            ver += f" ↑{update_text}"
+        return head + tail + stats + ver
 
     MUTE = _fg(theme.mute)
     EDGE = _fg(theme.edge)
     INK = _fg(theme.pill_ink)
     HOT = _fg(theme.s_warn)
 
-    head = f"{MUTE}⤷ {info.project_name}{RESET}"
+    # Project name in full ink — it's the line's identity anchor (user
+    # feedback 2026-07-02: mute made it near-invisible). The ⤷ stays mute.
+    head = f"{MUTE}⤷ {RESET}{INK}{info.project_name}{RESET}"
     if not info.in_git:
         body = f" {MUTE}{ITAL}(no git){RESET}"
     else:
@@ -347,7 +497,18 @@ def render_identity_line(info, *, theme: Theme, dirty,
             body += f" {_fg(theme.s_ok)}{ab}{RESET}"
     if info.is_worktree:
         body += f" {MUTE}[worktree]{RESET}"
-    return head + body + stats
+    if cwd_text and cwd_text != info.project_name:
+        body += f" {MUTE}·{RESET} {INK}{cwd_text}{RESET}"
+    # Version: the faintest thing on the line — edge (darkest grey) + dim
+    # attribute, so it's there if you look for it but never competes for attention.
+    ver = ""
+    if version_text:
+        ver = f" {FAINT}{EDGE}· v{version_text}{RESET}"
+        # Update available → a soft amber `↑<newver>` nudge (a bit more visible
+        # than the version, so you notice there's something to update to).
+        if update_text:
+            ver += f"{_fg(theme.s_warn)} ↑{update_text}{RESET}"
+    return head + body + stats + ver
 
 
 def render_activity_line(activity, *, theme: Theme, use_color: bool = True,
@@ -399,6 +560,111 @@ def render_activity_line(activity, *, theme: Theme, use_color: bool = True,
     return line
 
 
+def _clip_width(s: str, limit: int) -> str:
+    """Truncate `s` to `limit` display columns, appending … when cut.
+
+    Wide East-Asian glyphs count as two columns, so a CJK preview clips at the
+    same visual width as an ASCII one.
+    """
+    from unicodedata import east_asian_width
+
+    def w(ch):
+        return 2 if east_asian_width(ch) in ("W", "F") else 1
+
+    if sum(w(ch) for ch in s) <= limit:
+        return s
+    out, used = [], 0
+    for ch in s:
+        if used + w(ch) > limit - 1:
+            break
+        out.append(ch)
+        used += w(ch)
+    return "".join(out) + "…"
+
+
+def render_party_line(party, *, theme: Theme, use_color: bool = True) -> str:
+    """Render the AgentParty block: a header line plus the last message.
+
+    Header  ``#seamail · ⬡ leo-zego-voice · ◉ watching @mentions``
+    Message ``   ↳ ●@ Jarvis  <preview>  28m``
+
+    Glyphs are monochrome geometry, not emoji: they inherit the theme color (so
+    the listener state reads as a signal lamp — ``◉`` live, ``⊘`` down, ``◌``
+    unattached) and stay single-width. ``⬡`` is an agent, ``⬢`` a human.
+
+    The message gets its own line so a long preview can't push the header off
+    screen. Its two leading glyphs are the message's state: ``●`` unread /
+    ``○`` read, then ``@`` when the preview mentions us (a space otherwise, so
+    the sender column stays put).
+    """
+    if party is None:
+        return ""
+    channel = str(_attr(party, "channel", "") or "").strip()
+    identity = str(_attr(party, "identity_name", "") or "").strip()
+    kind = str(_attr(party, "identity_kind", "agent") or "agent").strip()
+    unread = int(_attr(party, "unread", 0) or 0)
+    listener_mode = str(_attr(party, "listener_mode", "") or "").strip()
+    last_from = str(_attr(party, "last_from", "") or "").strip()
+    last_preview = str(_attr(party, "last_preview", "") or "").strip()
+    last_age = str(_attr(party, "last_age", "") or "").strip()
+    fresh = bool(_attr(party, "fresh", True))
+    listener_stale = bool(_attr(party, "listener_stale", False))
+    listener_present = bool(_attr(party, "listener_present", bool(listener_mode)))
+    mentions_only = bool(_attr(party, "listener_mentions_only", False))
+    mentioned = bool(_attr(party, "mentioned", False))
+
+    if not any((channel, identity, unread, listener_mode, last_preview)):
+        return ""
+
+    INK  = _fg(theme.ink)
+    MUTE = _fg(theme.mute)
+    EDGE = _fg(theme.edge)
+    OK   = _fg(theme.s_ok)
+    WARN = _fg(theme.s_warn)
+    HOT  = _fg(theme.s_hot)
+    SEP  = f"{EDGE} · {RESET}"
+
+    # ---- header ---------------------------------------------------------
+    # The `#` is ours; a channel that already carries one must not render `##`.
+    chan = (channel.lstrip("#") or "AgentParty") if channel else "AgentParty"
+    head = [f"{EDGE}#{RESET}{INK}{chan}{RESET}"]
+    if identity:
+        icon = "⬢" if kind == "human" else "⬡"
+        head.append(f"{MUTE}{icon} {identity}{RESET}")
+
+    # Listening state is the question the header must answer outright: are we
+    # attached and hearing messages, or not? The glyph alone carries it.
+    if not listener_present:
+        head.append(f"{MUTE}◌ not listening{RESET}")
+    elif listener_stale:
+        head.append(f"{HOT}⊘ listener down{RESET}")
+    else:
+        verb = "serving" if listener_mode == "serve" else "watching"
+        scope = f" {MUTE}@mentions{RESET}" if mentions_only else ""
+        head.append(f"{OK}◉ {verb}{RESET}{scope}")
+
+    if unread > 0:
+        head.append(f"{WARN}{unread} unread{RESET}")
+    if not fresh:
+        head.append(f"{HOT}stale{RESET}")
+
+    lines = [SEP.join(head)]
+
+    # ---- last message, on its own line ----------------------------------
+    if last_preview:
+        hot_msg = unread > 0 or mentioned
+        dot = f"{WARN}●{RESET}" if unread > 0 else f"{EDGE}○{RESET}"
+        at = f"{WARN}@{RESET}" if mentioned else " "
+        who = f"{INK}{last_from}{RESET}" if hot_msg else f"{MUTE}{last_from}{RESET}"
+        who = f"{who}  " if last_from else ""
+        body = f"{MUTE}{_clip_width(last_preview, 54)}{RESET}"
+        age = f" {EDGE}{last_age}{RESET}" if last_age else ""
+        lines.append(f"   {EDGE}↳{RESET} {dot}{at} {who}{body}{age}")
+
+    out = "\n".join(lines)
+    return out if use_color else _strip(out)
+
+
 def render_agent_lines(agents, *, theme: Theme, use_color: bool = True) -> list:
     """One line per running subagent: `◐ <name>[<model>] <description> <elapsed>`.
 
@@ -426,6 +692,116 @@ def render_agent_lines(agents, *, theme: Theme, use_color: bool = True) -> list:
                 f"{desc_part} {MUTE}{el}{RESET}")
         lines.append(_strip(line) if not use_color else line)
     return lines
+
+
+# Per-effort gradient palettes — a MONOTONIC grey→blue→purple ladder matching
+# Claude Code's own "Faster → Smarter" effort slider (low … max, then ultracode
+# = xhigh+workflows as the distinct vivid-purple top). Each tier is visibly more
+# saturated/purple than the one below, so the level reads as an ordered ladder
+# (not the old rainbow, where coral `max` looked hotter than `ultracode`).
+_EFFORT_GRADIENTS = {
+    # DESATURATED cool→purple ladder — each tier sweeps toward the next hue so it
+    # reads as a gradient, but the colours are dusty/low-saturation so the line
+    # doesn't shout next to the rest of the (restrained) bar. ultracode is a touch
+    # brighter as the top tier.
+    "low":       [(120, 172, 168), (124, 158, 196)],             # dusty teal → blue
+    "auto":      [(120, 172, 168), (124, 158, 196)],             # neutral, like low
+    "medium":    [(122, 156, 198), (132, 146, 202)],             # dusty azure
+    "high":      [(130, 144, 204), (156, 140, 202)],             # dusty blue → indigo
+    "xhigh":     [(152, 138, 204), (176, 134, 200)],             # dusty indigo → violet
+    "max":       [(176, 134, 200), (196, 138, 196)],             # dusty violet → mauve
+    "ultracode": [(200, 138, 202), (220, 160, 208)],             # dusty magenta → pink (top)
+}
+# Fallback for unknown/future levels — the showcase vivid purple.
+_MODE_GRADIENT_STOPS = _EFFORT_GRADIENTS["ultracode"]
+
+
+def _effort_gradient_stops(level):
+    return _EFFORT_GRADIENTS.get(str(level).strip().lower(), _MODE_GRADIENT_STOPS)
+
+
+def _lerp_rgb(a, b, f):
+    return tuple(int(round(a[i] + (b[i] - a[i]) * f)) for i in range(3))
+
+
+def _grad_sample(stops, f):
+    """Sample a NON-cyclic gradient at f∈[0,1] across `stops` (clamped ends)."""
+    if f <= 0:
+        return stops[0]
+    if f >= 1:
+        return stops[-1]
+    x = f * (len(stops) - 1)
+    i = int(x)
+    return _lerp_rgb(stops[i], stops[i + 1], x - i)
+
+
+def _gradient_text(text: str, stops=None) -> str:
+    """A single STATIC gradient (palette `stops`) swept once across `text`, left
+    to right. Not animated: the statusLine refreshes at ≤1 Hz (and event-driven
+    in some builds), so any motion can only step ~1/s and reads as a flicker —
+    a clean stable sweep is the right call. The per-effort palette tells the tier."""
+    stops = stops or _MODE_GRADIENT_STOPS
+    n = len(text)
+    out = [
+        _fg(_grad_sample(stops, i / max(1, n - 1))) + ch
+        for i, ch in enumerate(text)
+    ]
+    return "".join(out) + RESET
+
+
+def _effort_display(level) -> str:
+    """Display string for the effort value. `ultracode` spells out what it means
+    (Claude Code: `ultracode = xhigh + workflows`); everything else verbatim."""
+    if str(level).strip().lower() == "ultracode":
+        return f"{level}(+workflows)"
+    return str(level)
+
+
+def _effort_color(level, theme):
+    """Colour the effort value by intensity tier (not severity): top tiers get a
+    soft amber 'cranked up' nudge, low/auto recede, the rest stay neutral. Values
+    are Claude Code's: low / medium / high / xhigh / max / ultracode / auto."""
+    lv = str(level).strip().lower()
+    if lv in ("xhigh", "max", "ultracode"):
+        return _fg(theme.s_warn)
+    if lv in ("low", "auto", ""):
+        return _fg(theme.mute)
+    return _fg(theme.ink)   # medium / high / unknown future values
+
+
+def render_mode_line(*, effort: str = "", thinking=None, fast=None,
+                     style: str = "", theme: Theme, use_color: bool = True,
+                     gradient: bool = True) -> str:
+    """Session-mode readout: `⚙ effort:high · think:on · fast:on · style:default`.
+
+    Each field is dropped when absent, so an older Claude Code that omits one
+    just shows fewer segments; returns '' when nothing is known. The effort value
+    is shown verbatim (handles any of low/medium/high/xhigh/max/ultracode/auto and
+    future values) and tinted by intensity. When `gradient` is on (default), the
+    WHOLE line gets a static gradient whose palette depends on the effort tier
+    (cool→hot: slate/blue/cyan/amber/coral/pink-purple), so the tier is obvious at
+    a glance. Static, not animated — the statusLine can't repaint faster than ~1 Hz,
+    so motion only flickers; a stable per-tier sweep is the clean result."""
+    segs = []  # (label, value, value_color)
+    if effort:
+        segs.append(("effort:", _effort_display(effort), _effort_color(effort, theme)))
+    if thinking is not None:
+        segs.append(("think:", "on" if thinking else "off", _fg(theme.ink)))
+    if fast is not None:
+        segs.append(("fast:", "on" if fast else "off", _fg(theme.ink)))
+    if style:
+        segs.append(("style:", str(style), _fg(theme.ink)))
+    if not segs:
+        return ""
+    plain = "⚙ " + " · ".join(f"{l}{v}" for l, v, _ in segs)
+    if not use_color:
+        return plain
+    if gradient:
+        return _gradient_text(plain, _effort_gradient_stops(effort))
+    MUTE = _fg(theme.mute)
+    body = f"{MUTE} · {RESET}".join(
+        f"{MUTE}{l}{RESET}{c}{v}{RESET}" for l, v, c in segs)
+    return f"{MUTE}⚙{RESET} " + body
 
 
 RENDERERS = {
@@ -459,8 +835,22 @@ def render(style: str, **kwargs) -> str:
     behind = kwargs.pop("identity_behind", None)
     duration_text = kwargs.pop("identity_duration", "")
     lines_text = kwargs.pop("identity_lines", "")
+    cwd_text = kwargs.pop("cwd_text", "")
+    ip_line_text = kwargs.pop("ip_line_text", "")
+    ip_line_level = kwargs.pop("ip_line_level", "ok")
+    fp_line_text = kwargs.pop("fp_line_text", "")
+    fp_line_level = kwargs.pop("fp_line_level", "ok")
+    show_version = kwargs.pop("identity_show_version", False)
+    show_mode = kwargs.pop("mode_show", False)
+    mode_effort = kwargs.pop("mode_effort", "")
+    mode_thinking = kwargs.pop("mode_thinking", None)
+    mode_fast = kwargs.pop("mode_fast", None)
+    mode_style = kwargs.pop("mode_style", "")
+    mode_gradient = kwargs.pop("mode_gradient", True)
+    kwargs.pop("mode_phase", None)   # accepted for back-compat; gradient is static
     activity = kwargs.pop("activity", None)
     activity_opts = kwargs.pop("activity_opts", None)
+    party = kwargs.pop("party", None)
     theme = kwargs.get("theme") or get_theme("graphite")
     use_color = kwargs.get("use_color", True)
 
@@ -468,11 +858,52 @@ def render(style: str, **kwargs) -> str:
     out = fn(**kwargs)
 
     if show_pb and info is not None:
+        version_text = _statusbar_version() if show_version else ""
+        update_text = _update_hint() if show_version else ""
         out = out + "\n" + render_identity_line(
             info, theme=theme, dirty=dirty, ahead=ahead, behind=behind,
             duration_text=duration_text, lines_text=lines_text,
+            version_text=version_text, update_text=update_text,
+            cwd_text=cwd_text,
             use_color=use_color,
         )
+    elif cwd_text:
+        # show_cwd is on but the identity line is off — give the directory its
+        # own minimal line, styled like the identity anchor.
+        if use_color:
+            out = (out + "\n" + f"{_fg(theme.mute)}⤷ {RESET}"
+                   f"{_fg(theme.pill_ink)}{cwd_text}{RESET}")
+        else:
+            out = out + "\n" + f"⤷ {cwd_text}"
+
+    party_line = render_party_line(party, theme=theme, use_color=use_color)
+    if party_line:
+        out = out + "\n" + party_line
+
+    # Dedicated egress-IP risk warning — appears only above the risk threshold
+    # (ip_risk.SHOW_THRESHOLD), amber for suspicious, red for bad. May be
+    # multi-line (summary + action); each sub-line is colored separately so a
+    # long warning wraps cleanly instead of being truncated. Not part of the
+    # git identity line: network state isn't repo identity.
+    def _emit_risk(text, level):
+        nonlocal out
+        if not text:
+            return
+        color = theme.s_hot if level == "crit" else theme.s_warn
+        for seg in text.split("\n"):
+            out = out + "\n" + (f"{_fg(color)}{seg}{RESET}" if use_color else seg)
+
+    _emit_risk(ip_line_text, ip_line_level)
+    # Relay fingerprint-risk warning line (local env inference; see fp_risk.py).
+    _emit_risk(fp_line_text, fp_line_level)
+
+    if show_mode:
+        mode_line = render_mode_line(
+            effort=mode_effort, thinking=mode_thinking, fast=mode_fast,
+            style=mode_style, theme=theme, use_color=use_color,
+            gradient=mode_gradient)
+        if mode_line:
+            out = out + "\n" + mode_line
 
     if activity_opts:
         opts = dict(activity_opts)
