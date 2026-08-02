@@ -4,7 +4,7 @@ Reference docs for [`claude-statusbar`](../README.md). Start with the main
 [README](../README.md) for the pitch and quick start; the guides below go deep.
 
 ## Getting started
-- [Install](install.md) — PyPI, one-shot installer, skill-only, plugin marketplace, Codex bridge
+- [Install](../README.md#quick-setup) — local-source-only install for this hardened fork
 - [What it shows](segments.md) — full per-segment reference table
 - [Styles & themes](styles-and-themes.md) — 3 styles × 9 themes, previews, slash commands
 - [Configuration](configuration.md) — config file, all `show_*` keys, env vars, JSON output, CLI cheatsheet

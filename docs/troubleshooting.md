@@ -34,22 +34,18 @@ Paste the output verbatim in any bug report — it's almost always enough to dia
 
 **`cs --setup --fast` then daemon shows wrong rate-limits** — Fixed in v3.2.1. Upgrade with `cs upgrade`.
 
-**Auto-update is annoying / blocked** — `export CLAUDE_STATUSBAR_NO_UPDATE=1` in your shell rc.
+**Auto-update is annoying / blocked** — nothing to do; auto-update is already permanently disabled in this fork (see [Security notes](../README.md#security-notes)).
 
-For anything else: open a [GitHub issue](https://github.com/leeguooooo/claude-code-usage-bar/issues) with the output of `cs doctor` attached — it captures version, paths, settings.json state, daemon state, and recent cache freshness in one paste.
+For anything else: run `cs doctor` and check the output — it captures version, paths, settings.json state, daemon state, and recent cache freshness in one paste.
 
 ## Upgrading
 
-Auto-updates once per day from PyPI. To upgrade manually, one command works for
-every install (pip, pipx, or uv — it detects which one is actually running `cs`
-and uses that, so you never need to know or guess):
+Auto-update and `cs upgrade` are disabled in this fork. To pick up changes:
 
 ```bash
-cs upgrade
+git pull                # or ./scripts/sync-upstream.sh to review new upstream commits
+pip install -e .        # or: uv tool install . / pipx install .
 ```
 
-Don't reach for `uv tool install`/`pipx upgrade` by hand — if you installed via
-`pip`, you may not even have those tools, and running the wrong one can leave
-you with two parallel installs. `cs upgrade` picks the right channel for you.
-
-To disable auto-updates: `export CLAUDE_STATUSBAR_NO_UPDATE=1`
+`./scripts/verify-security.sh` re-checks that the hardening patches are still
+intact after any pull.

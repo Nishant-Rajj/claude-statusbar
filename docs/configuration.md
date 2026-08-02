@@ -44,7 +44,7 @@ Persisted to `~/.claude/claude-statusbar.json`:
 | `show_projection` / `show_forecast` | bool, `true` | `→NN%` projection / `⚠ETA` at-risk warning chip |
 | `show_agents` | bool, `false` | One bottom line per running subagent (Claude Code shows these natively too) |
 | `show_duration` / `show_lines` | bool | Session `⏱` duration / `+/−` lines on the identity line |
-| `show_version` | bool, `true` | Faint `· vX.Y.Z` (+ amber `↑newver` when a newer PyPI release exists) |
+| `show_version` | bool, `true` | Faint `· vX.Y.Z`. The `↑newver` update hint never appears in this fork — auto-update is disabled, see [Security notes](../README.md#security-notes) |
 | `show_mode` / `mode_gradient` | bool, `true` | `⚙` session-mode line + effort-tier gradient tint |
 | `show_weekly` / `show_language` | bool | Toggle the 7d bar / language-coach segment |
 | `bar_shimmer` | bool, `false` | Experimental twinkling starfield on bars (classic only) |
@@ -124,7 +124,7 @@ cs doctor                       # self-diagnostic — paste output in bug report
 cs --json-output                # machine-readable JSON
 cs --no-color                   # disable ANSI colors
 cs --warning-threshold 40 --critical-threshold 85
-cs --no-auto-update             # skip the per-day PyPI version check
+cs --no-auto-update             # no-op in this fork — auto-update is already disabled
 ```
 
 `--plan` still exists for older scripts, but is deprecated and no longer changes the rendered output.

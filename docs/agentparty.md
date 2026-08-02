@@ -8,7 +8,7 @@ that channel/listener/unread context without making network calls.
 
 | Runtime | What `cs` can show | Data source | Setup |
 |---------|--------------------|-------------|-------|
-| Claude Code | 5h/7d quota, reset timers, model/context, prompt-cache age, session cost, project/git line, activity lines, and optional AgentParty block | Claude Code `statusLine` stdin plus local caches | `pip install claude-statusbar && cs --setup` |
+| Claude Code | 5h/7d quota, reset timers, model/context, prompt-cache age, session cost, project/git line, activity lines, and optional AgentParty block | Claude Code `statusLine` stdin plus local caches | `pip install -e .` from this repo, then `cs --setup` |
 | Codex + AgentParty | AgentParty channel, identity, listener state, unread count, and last-message preview | `~/.agentparty/state/<workspaceId>/statusline.json` written by AgentParty | Join/send/watch with `party`; keep `show_party` enabled |
 | Codex without AgentParty | No Codex quota/session accounting from this package | None | Use Codex's own UI/status surfaces |
 
