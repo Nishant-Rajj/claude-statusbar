@@ -12,8 +12,8 @@ DIST_NAME = "claude-statusbar"
 
 # Upstream's binary/curl-installer upgrade path is disabled in this fork —
 # see .security/patches.md Patch 1. No PyPI URL, no install.sh URL, no
-# subprocess calls to pip/uv/pipx, no latest-version cache file: nothing
-# in this module ever makes a network call or shells out.
+# shelling out to pip/uv/pipx, no latest-version cache file: nothing in
+# this module ever makes a network call or spawns a child process.
 
 
 def get_current_version() -> str:
