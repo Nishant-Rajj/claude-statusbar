@@ -134,6 +134,48 @@ push remote pointing at the upstream.
 
 ---
 
+## Patch 7 — Neuter egress-IP risk prober
+
+**Files**: `src/claude_statusbar/_ip_risk_refresh.py` (deleted),
+`src/claude_statusbar/ip_risk.py`, `src/claude_statusbar/daemon.py`
+
+**What upstream does**: The `show_ip_risk` feature (default off) spawns a detached
+prober that calls two third-party services at runtime — `https://api.ipify.org`
+(egress IP) and `https://api.ipapi.is/` (datacenter/VPN/proxy/Tor/China-cloud
+scoring) — to warn about Claude account ban risk. Unlike the PyPI updater, this
+network code was intact even before this patch, just gated behind a config flag:
+flipping `show_ip_risk` to `true` (deliberately, by mistake, or via a shared/
+tampered config file) was enough to start making outbound calls. The daemon also
+ran a 20s heartbeat that called the prober whenever the flag was on.
+
+**What we do**:
+- Delete `_ip_risk_refresh.py` entirely — the only file making the actual
+  `urllib` calls.
+- `ip_risk.ensure_fresh()` → no-op (`return None`), never spawns a subprocess.
+- `ip_risk.ip_risk_line()` → always returns `("", "ok")`, regardless of
+  `show_ip_risk` or any cached reading left over from a prior install.
+- Removed the daemon's IP heartbeat block entirely (dead code once
+  `ensure_fresh()` is a no-op).
+- `ip_score.py` (pure local risk-scoring math, no network) is left intact —
+  harmless, and `test_ip_score.py` still exercises it.
+
+**How to verify**:
+```bash
+test -f src/claude_statusbar/_ip_risk_refresh.py && echo "BROKEN: prober module exists"
+grep -n 'urllib' src/claude_statusbar/ip_risk.py   # must return nothing
+grep -n 'ip_risk\|ensure_fresh' src/claude_statusbar/daemon.py   # must return nothing
+```
+
+**How to reapply if broken**:
+```bash
+rm -f src/claude_statusbar/_ip_risk_refresh.py
+# ip_risk.py: ensure_fresh() must be `return None`;
+#             ip_risk_line() must be `return "", "ok"` unconditionally.
+# daemon.py: remove any call to ip_risk.ensure_fresh() from run_forever().
+```
+
+---
+
 ## Adding a new patch
 
 When you apply a new security fix, document it here:

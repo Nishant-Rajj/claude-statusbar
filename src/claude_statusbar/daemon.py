@@ -646,12 +646,6 @@ def run_forever(render_interval: float = DEFAULT_RENDER_INTERVAL) -> int:
     _log(f"daemon started pid={os.getpid()} interval={render_interval}s")
 
     GC_INTERVAL_S = 60 * 30  # garbage-collect stale session dirs every 30 min
-    # Egress-IP risk re-check heartbeat. Runs on the daemon's own clock so a
-    # network change (VPN on/off) reflects even while the user is idle and
-    # Claude Code isn't re-rendering the statusline. The prober itself decides
-    # whether a re-check is actually due (its own TTL) and self-throttles via
-    # the inflight marker, so this can fire generously.
-    IP_HEARTBEAT_S = 20.0
     # Defer the first *session* GC by one full interval — without this the
     # first tick of every fresh daemon would scan the sessions tree,
     # potentially racing with a Claude Code window that's mid-restart.
@@ -663,24 +657,12 @@ def run_forever(render_interval: float = DEFAULT_RENDER_INTERVAL) -> int:
     # fired. Observed live: 15 orphaned .tmp files, the oldest 99 min old,
     # against a 60-minute TMP_GC_AFTER_S cutoff.
     last_maint = 0.0
-    last_ip = 0.0
+    # No egress-IP heartbeat here — that prober is disabled in this fork,
+    # see .security/patches.md Patch 7.
     try:
         while _running:
             t0 = time.time()
             _render_all_sessions()
-            if t0 - last_ip > IP_HEARTBEAT_S:
-                last_ip = t0
-                # Only probe when the user actually enabled the egress-IP risk
-                # line. Default users (show_ip_risk off) make ZERO third-party
-                # calls — the feature is regional/niche and opt-in, so it must
-                # never phone home for people who didn't ask for it.
-                try:
-                    from .config import load_config
-                    if load_config().show_ip_risk:
-                        from . import ip_risk
-                        ip_risk.ensure_fresh()
-                except Exception:
-                    pass
             if t0 - last_maint > GC_INTERVAL_S:
                 _gc_orphan_tmp_files()
                 # Auto-update is disabled in this local fork (see

@@ -92,84 +92,6 @@ Colors default to green / yellow / red at 30% and 70% — both configurable.
 
 ---
 
-## Contents
-
-- [Quick setup](#quick-setup)
-- [Requirements](#requirements)
-- [What it shows](#what-it-shows)
-- [Styles & themes](#styles--themes)
-- [Configuration](#configuration)
-- [Fast mode (daemon)](#fast-mode-daemon)
-- [Slash commands](#slash-commands)
-- [Usage cheatsheet](#usage-cheatsheet)
-- [Environment variables](#environment-variables)
-- [How the cache countdown works](#how-the-cache-countdown-works)
-- [Troubleshooting](#troubleshooting)
-- [Security notes](#security-notes)
-
----
-
-## Quick setup
-
-```bash
-# 1. Copy this repo to your machine (or server)
-git clone <your-repo-url> claude-code-usage-bar
-cd claude-code-usage-bar
-
-# 2. Install from local source — never touches PyPI
-pip install -e .
-# or with uv (recommended)
-uv tool install .
-# or with pipx
-pipx install .
-
-# 3. Wire the statusLine hook and install slash commands
-cs --setup
-
-# 4. Restart Claude Code
-```
-
-That's it. The status bar appears at the bottom of Claude Code on next launch.
-
-### Verify it works
-
-```bash
-cs doctor          # self-diagnostic — check all wiring
-cs preview         # render every style × theme using your real data
-```
-
----
-
-## Requirements
-
-- Python 3.9+
-- Claude Code v2.1.80+
-- macOS or Linux
-
----
-
-## What it shows
-
-```
-5h[   27%    ]⏰1h28m | 7d[   79%    ]⏰11h28m | Opus 4.7(350.0k/1.0M) | cache 4m23s | $ 1.42
-⤷ my-project ⎇ main●
-```
-
-| Segment | Meaning |
-|---------|---------|
-| `5h[27%]` | 5-hour rate-limit usage (from Anthropic API headers) |
-| `⏰1h28m` | Time until the 5-hour window resets |
-| `7d[79%]` | 7-day rate-limit usage |
-| `⏰11h28m` | Time until the 7-day window resets |
-| `Opus 4.7(350.0k/1.0M)` | Model name + context window used / total |
-| `cache 4m23s` / `cache COLD` | Countdown to prompt-cache expiry. TTL (5min vs 1h) is auto-detected from the transcript. Green → comfortable, yellow → under 1 min, red → expired. Cache hits consume ~10× less rate-limit quota. |
-| `$ 1.42` | Session cost. For Pro/Max subscribers this is the API-equivalent value, not money owed. Opt-in: `cs config set show_cost true` |
-| `⤷ <project> ⎇ <branch>●` | Second-line identity. Project from `workspace.repo.name`, branch from `.git/HEAD`. `●` = dirty working tree. |
-
-Colors default to green / yellow / red at 30% and 70% — both configurable.
-
----
-
 3 styles × 9 themes = 27 combinations. Try them all with `cs preview`.
 
 ### Styles
@@ -410,10 +332,13 @@ This fork has the following changes from upstream relative to the original `leeg
 | `install.sh` / `web-install.sh` deleted | Removed curl-pipe-bash install scripts |
 | Git remote `origin` removed | Prevents accidental `git pull` from upstream |
 | All upstream URLs stripped from metadata | `pyproject.toml`, `plugin.json`, `FUNDING.yml` |
+| `_ip_risk_refresh.py` deleted, `ip_risk.py` neutered | Removes calls to `api.ipify.org` / `api.ipapi.is` — see Patch 7 |
 
-**Runtime network surface: zero.** The only outbound calls at runtime are to `pypi.org` — and those are now removed. The binary runs fully offline after install.
+**Third-party network surface: zero.** No calls to PyPI, GitHub, or IP-intelligence services, regardless of config. The one remaining outbound call (`show_balance`) only contacts the relay endpoint *you've already configured* via `ANTHROPIC_BASE_URL`, using your own key — not a new third party, and only in no-quota/relay mode.
 
 **Install only from this local copy.** Never run `pip install claude-statusbar` — that fetches the upstream package which has auto-update enabled.
+
+Full patch-by-patch detail (what upstream does, what we do, how to verify, how to reapply): [`.security/patches.md`](.security/patches.md). Run `./scripts/verify-security.sh` after any upstream sync.
 
 ---
 

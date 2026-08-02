@@ -63,8 +63,10 @@ class StatusbarConfig:
     show_tools: bool = False
     show_tool_rollup: bool = False
     show_agents: bool = False
-    # Egress-IP risk chip on the identity line (proxycheck.io, 30-min cadence,
-    # detached prober — see ip_risk.py). Opt-in: it talks to a third party.
+    # Egress-IP risk chip — DISABLED in this local fork regardless of this
+    # flag's value. Upstream's prober called two third-party services
+    # (api.ipify.org, api.ipapi.is); that code has been removed. Kept as a
+    # no-op key for config-file compatibility. See .security/patches.md Patch 7.
     show_ip_risk: bool = False
     # Relay fingerprint-risk warning line: relay base URL + a marked system
     # timezone → Claude Code's request is fingerprintable (see fp_risk.py).

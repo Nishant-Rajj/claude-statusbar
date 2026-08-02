@@ -1,16 +1,11 @@
-"""Egress-IP risk segment (``show_ip_risk``).
+"""Egress-IP risk segment (``show_ip_risk``) — DISABLED in this local fork.
 
-Answers "how clean is the IP my traffic exits from right now?" — users on
-relays/VPNs care because a dirty egress IP raises account-risk. Data source
-is proxycheck.io's free tier (risk score 0-100 + proxy/VPN flag, no key
-needed); the reference site the user compares against (ippure.com) hides its
-API behind browser fingerprinting, so it can't back a CLI.
-
-Same architecture as the relay-balance segment: the render path ONLY reads a
-cache file; when the cache is stale a detached ``_ip_risk_refresh`` process
-re-probes (two ~8s HTTP calls) and rewrites the cache. Nothing on the render
-path ever touches the network. Probe cadence is IP_RISK_TTL_S (30 min) — the
-user explicitly does not want per-render checking.
+Upstream's version spawns a detached prober (``_ip_risk_refresh``) that calls
+two third-party services (api.ipify.org, api.ipapi.is) to score egress-IP
+ban risk. That prober module has been deleted and ``ensure_fresh()`` /
+``ip_risk_line()`` below are neutered to no-ops — see .security/patches.md
+Patch 7. This fork makes zero calls to those services regardless of the
+``show_ip_risk`` config value.
 """
 import json
 import os
@@ -161,42 +156,19 @@ def line_text(entry: Dict[str, Any]) -> str:
 
 
 def ip_risk_line(*, spawn: bool = True) -> Tuple[str, str]:
-    """(text, level) for the dedicated warning line; ("", "ok") = hidden.
+    """Always ("", "ok") — this fork never shows the egress-IP risk line.
 
-    Fresh ok cache → render it. Stale → keep rendering the last good reading
-    (risk doesn't flap minute-to-minute) while a detached refresh runs.
-    Clean IP, failed probe, or no cache → hidden line, zero noise.
+    Upstream would render the last-cached ipapi.is reading here and spawn a
+    refresh. Disabled unconditionally, regardless of ``show_ip_risk`` or any
+    cache file left over from a prior install — see .security/patches.md
+    Patch 7.
     """
-    entry = read_cache()
-    if spawn:
-        ensure_fresh(entry)
-    if isinstance(entry, dict) and entry.get("ok"):
-        return line_text(entry), risk_level(entry)
     return "", "ok"
 
 
 def ensure_fresh(entry=None) -> None:
-    """Spawn the detached prober if the cache is due for a re-check and one
-    isn't already running. Safe to call from anywhere (render path AND the
-    daemon heartbeat) — the inflight marker prevents double-spawns. Never
-    raises."""
-    try:
-        if entry is None:
-            entry = read_cache()
-        if should_refresh(entry) and not is_inflight():
-            mark_inflight()
-            try:
-                import subprocess
-                import sys
-                subprocess.Popen(
-                    [sys.executable, "-m", "claude_statusbar._ip_risk_refresh"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    close_fds=True,
-                    start_new_session=True,
-                )
-            except (OSError, ValueError):
-                clear_inflight()
-    except Exception:
-        pass
+    """No-op. Disabled in this local fork — see .security/patches.md Patch 7.
+
+    Upstream spawns a detached prober that calls api.ipify.org and
+    api.ipapi.is; that prober module has been deleted."""
+    return None

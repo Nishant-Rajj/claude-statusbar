@@ -103,6 +103,29 @@ else
   ok ".github/FUNDING.yml: does not exist (deleted)"
 fi
 
+# ── 10. egress-IP risk prober must not exist
+if [[ -f "$REPO/src/claude_statusbar/_ip_risk_refresh.py" ]]; then
+  fail "_ip_risk_refresh.py: egress-IP prober is back — delete it"
+else
+  ok "_ip_risk_refresh.py: does not exist (deleted)"
+fi
+
+# ── 11. ip_risk.py must not contain urllib (no network call reachable)
+f="$REPO/src/claude_statusbar/ip_risk.py"
+if grep -q 'urllib' "$f" 2>/dev/null; then
+  fail "ip_risk.py: urllib found — network call re-introduced"
+else
+  ok "ip_risk.py: no urllib"
+fi
+
+# ── 12. daemon.py must not reference the ip-risk prober
+f="$REPO/src/claude_statusbar/daemon.py"
+if grep -qE 'ip_risk|ensure_fresh' "$f" 2>/dev/null; then
+  fail "daemon.py: still references the ip-risk prober — heartbeat call site is back"
+else
+  ok "daemon.py: no ip-risk prober heartbeat"
+fi
+
 # ── Summary
 echo "────────────────────────────────────────"
 echo -e "  ${GREEN}${PASS} passed${NC}  |  ${RED}${FAIL} failed${NC}"
