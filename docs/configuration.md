@@ -44,6 +44,7 @@ Persisted to `~/.claude/claude-statusbar.json`:
 | `show_projection` / `show_forecast` | bool, `true` | `→NN%` projection / `⚠ETA` at-risk warning chip |
 | `show_agents` | bool, `false` | One bottom line per running subagent (Claude Code shows these natively too) |
 | `show_duration` / `show_lines` | bool | Session `⏱` duration / `+/−` lines on the identity line |
+| `show_account` / `account_style` | bool, `false` / `email`,`name`,`both`, `email` | Logged-in account on the identity line — useful on a machine running several accounts via `CLAUDE_CONFIG_DIR` |
 | `show_version` | bool, `true` | Faint `· vX.Y.Z`. The `↑newver` update hint never appears in this fork — auto-update is disabled, see [Security notes](../README.md#security-notes) |
 | `show_mode` / `mode_gradient` | bool, `true` | `⚙` session-mode line + effort-tier gradient tint |
 | `show_weekly` / `show_language` | bool | Toggle the 7d bar / language-coach segment |
@@ -91,6 +92,8 @@ cs config set show_tools true   # activity line: active tool + completed rollup
 cs config set show_agents true  # bottom line(s): running subagents + elapsed
 cs config set show_duration true # identity line: ⏱ session duration
 cs config set show_lines false  # hide identity-line +added -removed (on by default)
+cs config set show_account true   # identity line: show the logged-in account (email by default)
+cs config set account_style name  # show display name instead of email (or "both")
 cs config set show_version false  # hide the faint · vX.Y.Z (+ ↑update hint) at line end
 cs config set show_mode false    # hide the ⚙ effort/thinking/fast/style line
 cs config set mode_gradient false # mode line: plain per-tier colours, no gradient

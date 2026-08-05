@@ -50,6 +50,8 @@ def _run_config_subcommand(rest):
         print(f"show_project_branch = {cfg.show_project_branch}")
         print(f"show_party          = {cfg.show_party}")
         print(f"show_ahead_behind   = {cfg.show_ahead_behind}")
+        print(f"show_account        = {cfg.show_account}")
+        print(f"account_style       = {cfg.account_style}")
         print(f"show_todos          = {cfg.show_todos}")
         print(f"show_tools          = {cfg.show_tools}")
         print(f"show_tool_rollup    = {cfg.show_tool_rollup}")

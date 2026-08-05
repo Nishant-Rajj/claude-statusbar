@@ -433,7 +433,7 @@ def render_identity_line(info, *, theme: Theme, dirty,
                          ahead=None, behind=None,
                          duration_text: str = "", lines_text: str = "",
                          version_text: str = "", update_text: str = "",
-                         cwd_text: str = "",
+                         cwd_text: str = "", account_text: str = "",
                          use_color: bool = True) -> str:
     """Render the 2nd line: `⤷ <project> ⎇ <branch>●↑2↓1 · ⏱ <dur> · +/-lines`.
 
@@ -450,6 +450,10 @@ def render_identity_line(info, *, theme: Theme, dirty,
     `cwd_text` (show_cwd, #30) is the session's working directory; it's
     appended after the branch only when it adds information — skipped when it
     equals the project name (cwd at the repo root would just repeat the anchor).
+
+    `account_text` (show_account, multi-account) is the logged-in account's
+    email/name/both, per `account_style` — appended so it's clear whose usage
+    the numbers on the line above belong to.
     """
     ab = _ahead_behind_glyphs(ahead, behind) if info.in_git else ""
     stats = _stats_segment(duration_text, lines_text, theme=theme,
@@ -469,6 +473,8 @@ def render_identity_line(info, *, theme: Theme, dirty,
             tail += " [worktree]"
         if cwd_text and cwd_text != info.project_name:
             tail += f" · {cwd_text}"
+        if account_text:
+            tail += f" · {account_text}"
         ver = f" · v{version_text}" if version_text else ""
         if version_text and update_text:
             ver += f" ↑{update_text}"
@@ -499,6 +505,8 @@ def render_identity_line(info, *, theme: Theme, dirty,
         body += f" {MUTE}[worktree]{RESET}"
     if cwd_text and cwd_text != info.project_name:
         body += f" {MUTE}·{RESET} {INK}{cwd_text}{RESET}"
+    if account_text:
+        body += f" {MUTE}·{RESET} {INK}{account_text}{RESET}"
     # Version: the faintest thing on the line — edge (darkest grey) + dim
     # attribute, so it's there if you look for it but never competes for attention.
     ver = ""
@@ -836,6 +844,7 @@ def render(style: str, **kwargs) -> str:
     duration_text = kwargs.pop("identity_duration", "")
     lines_text = kwargs.pop("identity_lines", "")
     cwd_text = kwargs.pop("cwd_text", "")
+    account_text = kwargs.pop("account_text", "")
     ip_line_text = kwargs.pop("ip_line_text", "")
     ip_line_level = kwargs.pop("ip_line_level", "ok")
     fp_line_text = kwargs.pop("fp_line_text", "")
@@ -864,17 +873,19 @@ def render(style: str, **kwargs) -> str:
             info, theme=theme, dirty=dirty, ahead=ahead, behind=behind,
             duration_text=duration_text, lines_text=lines_text,
             version_text=version_text, update_text=update_text,
-            cwd_text=cwd_text,
+            cwd_text=cwd_text, account_text=account_text,
             use_color=use_color,
         )
-    elif cwd_text:
-        # show_cwd is on but the identity line is off — give the directory its
-        # own minimal line, styled like the identity anchor.
+    elif cwd_text or account_text:
+        # show_cwd and/or show_account are on but the identity line itself is
+        # off — give them their own minimal line, styled like the identity
+        # anchor, rather than dropping the information.
+        joined = " · ".join(t for t in (cwd_text, account_text) if t)
         if use_color:
             out = (out + "\n" + f"{_fg(theme.mute)}⤷ {RESET}"
-                   f"{_fg(theme.pill_ink)}{cwd_text}{RESET}")
+                   f"{_fg(theme.pill_ink)}{joined}{RESET}")
         else:
-            out = out + "\n" + f"⤷ {cwd_text}"
+            out = out + "\n" + f"⤷ {joined}"
 
     party_line = render_party_line(party, theme=theme, use_color=use_color)
     if party_line:

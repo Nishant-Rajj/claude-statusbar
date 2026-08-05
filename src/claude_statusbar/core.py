@@ -45,7 +45,6 @@ def parse_stdin_data() -> Dict[str, Any]:
         if not raw:
             return result
 
-        debug_file = Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json"
         data = json.loads(raw)
         # Mark stdin as valid the moment we parse it. If any per-field
         # extraction below raises (e.g. Anthropic ships an unexpected shape),
@@ -56,7 +55,8 @@ def parse_stdin_data() -> Dict[str, Any]:
 
         # Per-session env stamped by render_thin (`_cs_env`): the shared daemon's
         # os.environ is frozen at its own start and is NOT this session's, so
-        # no-quota detection must read this instead of os.environ when present.
+        # no-quota detection AND account identity must read this instead of
+        # os.environ when present.
         session_env = data.get('_cs_env')
         if isinstance(session_env, dict):
             result['_session_env'] = {str(k): str(v)
@@ -64,6 +64,15 @@ def parse_stdin_data() -> Dict[str, Any]:
             _env = result['_session_env']
         else:
             _env = os.environ
+
+        # Account-scoped: this file is a cross-account fallback source below
+        # (a session with no live rate_limits yet reads whatever was last
+        # written here), so an unsuffixed shared path would let one account's
+        # quota leak into another's early-session render under the shared
+        # daemon. See predict.account_scoped_path / render_thin._persist_stdin_bytes.
+        from .predict import account_scoped_path
+        debug_file = account_scoped_path(
+            Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json", _env)
 
         # Only cache stdin when it contains rate_limits (avoid overwriting with empty data).
         # Skip when the environment is a relay/cloud backend: a relay that happens
@@ -833,7 +842,7 @@ def _last_assistant_age(transcript_path: str) -> Optional[float]:
     return info[0] if info is not None else None
 
 
-def get_cache_age_text(ttl_seconds: Optional[int] = None) -> str:
+def get_cache_age_text(ttl_seconds: Optional[int] = None, env: Optional[dict] = None) -> str:
     """Return cache state as a COUNTDOWN to expiry.
 
     Display semantics:
@@ -860,7 +869,9 @@ def get_cache_age_text(ttl_seconds: Optional[int] = None) -> str:
     my next prompt before the cache dies?". A countdown answers directly;
     elapsed forces the user to mentally subtract.
     """
-    cache_file = Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json"
+    from .predict import account_scoped_path
+    cache_file = account_scoped_path(
+        Path.home() / ".cache" / "claude-statusbar" / "last_stdin.json", env)
 
     try:
         raw = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -1018,7 +1029,7 @@ def main(json_output: bool = False,
             cache_age_text = format_cache_countdown(
                 activity.cache_age_seconds, activity.cache_ttl)
         else:
-            cache_age_text = get_cache_age_text()
+            cache_age_text = get_cache_age_text(env=_effective_env)
 
     # Experimental bar shimmer: a phase that advances one cell per render.
     # Capped at the statusLine's ~1Hz refresh, so it's a slow step. classic only.
@@ -1058,6 +1069,26 @@ def main(json_output: bool = False,
             ahead, behind = read_ahead_behind(info.toplevel)
             identity_kwargs["identity_ahead"] = ahead
             identity_kwargs["identity_behind"] = behind
+
+    # Optional logged-in-account segment (multi-account): only useful on a
+    # machine running several accounts (different CLAUDE_CONFIG_DIR per
+    # shell), where it's otherwise unclear whose usage the bar is showing.
+    # Opt-in like show_cwd — reads the same env-aware ~/.claude.json this
+    # render's quota numbers were reconciled from, so the label always
+    # matches the numbers next to it.
+    account_kwargs = {}
+    if cfg.show_account:
+        from .predict import account_identity
+        _name, _email = account_identity(env=_effective_env)
+        if cfg.account_style == "email":
+            _acct_text = _email or _name
+        elif cfg.account_style == "name":
+            _acct_text = _name or _email
+        else:  # "both"
+            _acct_text = f"{_name} ({_email})" if (_name and _email) else (_name or _email)
+        if _acct_text:
+            account_kwargs = {"account_text": _acct_text}
+
     # Optional AgentParty line (#54): local-only cwd-scoped status cache. This
     # never imports or shells out to AgentParty and never reads tokens.
     #
@@ -1224,7 +1255,7 @@ def main(json_output: bool = False,
                     balance_text=balance_text,
                     balance_pct=balance_pct,
                     balance_amount=balance_amount,
-                    **identity_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                    **identity_kwargs, **account_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
                     **activity_kwargs,
                 ))
         elif has_official:
@@ -1241,6 +1272,7 @@ def main(json_output: bool = False,
                     session_id=stdin_data.get('session_id') or None,
                     # parse_stdin_data flattens stdin's model.id to 'model_id'
                     model=stdin_data.get('model_id') or None,
+                    env=_effective_env,
                 )
             except Exception:
                 pass
@@ -1310,6 +1342,7 @@ def main(json_output: bool = False,
                             resets_7d=resets_at_7d,
                             now=_t.time(),
                             session_id=stdin_data.get("session_id", ""),
+                            env=_effective_env,
                         )
                         projection_kwargs = {"projection_5h": p5 or "", "projection_7d": p7 or ""}
                     except Exception:
@@ -1326,6 +1359,7 @@ def main(json_output: bool = False,
                             used_7d=weekly_pct,
                             resets_7d=resets_at_7d,
                             now=_t.time(),
+                            env=_effective_env,
                         )
                         forecast_kwargs = {"forecast_5h": f5 or "", "forecast_7d": f7 or ""}
                     except Exception:
@@ -1346,7 +1380,7 @@ def main(json_output: bool = False,
                     shimmer_phase=shimmer_phase,
                     **projection_kwargs,
                     **forecast_kwargs,
-                    **identity_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                    **identity_kwargs, **account_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
                     **activity_kwargs,
                 ))
         else:
@@ -1372,7 +1406,7 @@ def main(json_output: bool = False,
                             stdin_data.get('transcript_path', ''))):
                     try:
                         from .predict import quota_cache_status
-                        _st, _ = quota_cache_status()
+                        _st, _ = quota_cache_status(env=_effective_env)
                         quota_stale = (_st == "stale")
                     except Exception:
                         quota_stale = False
@@ -1402,7 +1436,7 @@ def main(json_output: bool = False,
                         ctx_pct=ctx_pct,
                         shimmer_phase=shimmer_phase,
                         quota_stale=quota_stale,
-                        **identity_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                        **identity_kwargs, **account_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
                         **activity_kwargs,
                     ))
             else:
@@ -1434,7 +1468,7 @@ def main(json_output: bool = False,
                 warning_threshold=warning_threshold,
                 critical_threshold=critical_threshold,
                 density=cfg.density, show_weekly=cfg.show_weekly,
-                **identity_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
+                **identity_kwargs, **account_kwargs, **cwd_kwargs, **party_kwargs, **mode_kwargs, **ip_line_kwargs, **fp_line_kwargs,
             ))
 
 if __name__ == '__main__':

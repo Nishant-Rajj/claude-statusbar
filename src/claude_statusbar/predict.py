@@ -69,51 +69,108 @@ _LATEST_PATH = Path(os.path.expanduser("~")) / ".cache" / "claude-statusbar" / "
 # a raw regex scan is ~0.6ms and is memoized on (mtime_ns, size), so renders
 # normally pay only a stat()). Unknown account (no file / API-key users) falls
 # back to the legacy unsuffixed paths — pre-switch behaviour, unchanged.
+#
+# CLAUDE_CONFIG_DIR: Claude Code relocates ~/.claude.json to
+# $CLAUDE_CONFIG_DIR/.claude.json when that var is set — the documented way to
+# run several accounts on one machine. Hardcoding ~/.claude.json here meant
+# every such account either fell through to the legacy unsuffixed store or
+# all keyed off whichever account's real ~/.claude.json happened to still
+# exist — one account's usage silently repainting every other account's bar
+# (live incident 2026-08-05, two accounts on one shared machine). The shared
+# daemon's own os.environ is frozen at its start, same failure mode already
+# fixed for CS_API_MODE (see render_thin._SESSION_ENV_KEYS /
+# core.parse_stdin_data's `_env`), so every function below takes an optional
+# `env` mapping — the per-session env render_thin stamps into `_cs_env` — and
+# only falls back to os.environ when none is given.
 _CLAUDE_JSON_PATH = Path(os.path.expanduser("~")) / ".claude.json"
-_ACCOUNT_CACHE: Dict[str, Any] = {"sig": None, "id": None}
+# Capped, keyed by resolved path — NOT a single slot — because alternating
+# renders from two accounts under one shared daemon (exactly the
+# multi-CLAUDE_CONFIG_DIR scenario this exists for) must not invalidate each
+# other's cache entry every tick. Same bound as MAX_RESET_BUCKETS: a handful
+# of parallel accounts is the realistic ceiling.
+_MAX_ACCOUNT_CACHE_ENTRIES = 8
+_ACCOUNT_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def _read_account_id() -> Optional[str]:
+def _claude_json_path(env: Optional[Dict[str, str]] = None) -> Path:
+    """~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json when that's set in
+    `env` (falls back to os.environ when `env` is None)."""
+    source = os.environ if env is None else env
+    cfg_dir = source.get("CLAUDE_CONFIG_DIR")
+    if cfg_dir:
+        return Path(cfg_dir).expanduser() / ".claude.json"
+    return _CLAUDE_JSON_PATH
+
+
+def _read_account(env: Optional[Dict[str, str]] = None) -> Dict[str, Optional[str]]:
+    """{id, display_name, email} for the account at this env's ~/.claude.json.
+    Memoized per resolved path so two accounts alternating on one daemon don't
+    thrash each other's cache entry."""
+    path = _claude_json_path(env)
+    key = str(path)
+    empty = {"id": None, "display_name": None, "email": None}
     try:
-        st = _CLAUDE_JSON_PATH.stat()
+        st = path.stat()
         sig = (st.st_mtime_ns, st.st_size)
-        if _ACCOUNT_CACHE["sig"] == sig:
-            return _ACCOUNT_CACHE["id"]
-        data = _CLAUDE_JSON_PATH.read_bytes()
     except OSError:
-        return None
+        _ACCOUNT_CACHE.pop(key, None)
+        return empty
+    cached = _ACCOUNT_CACHE.get(key)
+    if cached is not None and cached.get("sig") == sig:
+        return cached
+    try:
+        data = path.read_bytes()
+    except OSError:
+        _ACCOUNT_CACHE.pop(key, None)
+        return empty
     import re
     # Anchor on the oauthAccount object so an unrelated future "accountUuid"
-    # key elsewhere in the file can't shadow the login identity.
+    # (or "displayName"/"emailAddress") key elsewhere in the file can't shadow
+    # the login identity.
     anchor = data.find(b'"oauthAccount"')
-    m = re.search(rb'"accountUuid"\s*:\s*"([0-9a-fA-F-]{8,64})"',
-                  data[anchor:] if anchor >= 0 else data)
-    aid = m.group(1).decode("ascii") if m else None
-    _ACCOUNT_CACHE["sig"] = sig
-    _ACCOUNT_CACHE["id"] = aid
-    return aid
+    window = data[anchor:] if anchor >= 0 else data
+    m_id = re.search(rb'"accountUuid"\s*:\s*"([0-9a-fA-F-]{8,64})"', window)
+    m_name = re.search(rb'"displayName"\s*:\s*"([^"]*)"', window)
+    m_email = re.search(rb'"emailAddress"\s*:\s*"([^"]*)"', window)
+    result: Dict[str, Optional[str]] = {
+        "sig": sig,
+        "id": m_id.group(1).decode("ascii") if m_id else None,
+        "display_name": m_name.group(1).decode("utf-8", "replace") if m_name else None,
+        "email": m_email.group(1).decode("utf-8", "replace") if m_email else None,
+    }
+    _ACCOUNT_CACHE[key] = result
+    if len(_ACCOUNT_CACHE) > _MAX_ACCOUNT_CACHE_ENTRIES:
+        _ACCOUNT_CACHE.pop(next(iter(_ACCOUNT_CACHE)))
+    return result
 
 
-def account_id() -> Optional[str]:
+def account_id(env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Uuid of the currently logged-in Claude account, or None if undetectable."""
-    return _read_account_id()
+    return _read_account(env)["id"]
 
 
-def _account_path(base: Path) -> Path:
+def account_identity(env: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[str]]:
+    """(display_name, email) of the currently logged-in Claude account —
+    either may be None if undetectable."""
+    r = _read_account(env)
+    return r["display_name"], r["email"]
+
+
+def account_scoped_path(base: Path, env: Optional[Dict[str, str]] = None) -> Path:
     """Per-account variant of a shared-store path (`rate_latest.<uuid12>.json`).
     Unknown account → the legacy unsuffixed path."""
-    aid = account_id()
+    aid = account_id(env)
     if not aid:
         return base
     return base.with_name(f"{base.stem}.{aid[:12]}{base.suffix}")
 
 
-def _latest_path() -> Path:
-    return _account_path(_LATEST_PATH)
+def _latest_path(env: Optional[Dict[str, str]] = None) -> Path:
+    return account_scoped_path(_LATEST_PATH, env)
 
 
-def _projection_path() -> Path:
-    return _account_path(_PROJECTION_PATH)
+def _projection_path(env: Optional[Dict[str, str]] = None) -> Path:
+    return account_scoped_path(_PROJECTION_PATH, env)
 
 MAX_PROJECTION_SAMPLES = 5000
 MAX_PROJECTION_SNAPSHOTS = 1000
@@ -294,7 +351,7 @@ def _load_buckets(win_entry: Any) -> Dict[str, Dict[str, Any]]:
             if isinstance(v, dict) and _coerce(v.get("used")) is not None}
 
 
-def quota_cache_status(now=None, path=None):
+def quota_cache_status(now=None, path=None, env=None):
     """Classify the persisted rate-limit cache: ("fresh"|"stale"|"empty", age_s).
 
     * empty — no store, or no usable window buckets (a genuinely new account).
@@ -310,7 +367,7 @@ def quota_cache_status(now=None, path=None):
     if now is None:
         import time as _t
         now = _t.time()
-    p = Path(path) if path is not None else _latest_path()
+    p = Path(path) if path is not None else _latest_path(env)
     try:
         store = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(store, dict):
@@ -335,10 +392,10 @@ def quota_cache_status(now=None, path=None):
     return ("fresh" if plausible else "stale", age)
 
 
-def regime_changed_at(path=None):
+def regime_changed_at(path=None, env=None):
     """Timestamp of the last burn-rate regime boundary (model switch or
     novel-model fleet join), or None. Never raises."""
-    p = Path(path) if path is not None else _latest_path()
+    p = Path(path) if path is not None else _latest_path(env)
     try:
         store = json.loads(p.read_text(encoding="utf-8"))
         return _coerce((store.get("regime") or {}).get("changed_at"))
@@ -347,7 +404,7 @@ def regime_changed_at(path=None):
 
 
 def reconcile_account(used_5h, resets_5h, used_7d, resets_7d, path=None, now=None,
-                      session_id=None, record=True, model=None):
+                      session_id=None, record=True, model=None, env=None):
     """Merge this session's reading into the shared store and return the
     freshest (u5, r5, u7, r7) FOR THIS SESSION'S WINDOWS.
 
@@ -372,7 +429,7 @@ def reconcile_account(used_5h, resets_5h, used_7d, resets_7d, path=None, now=Non
     unchanged: monotonic up, equal readings refresh the grace clock, lower
     readings accepted as an official re-baseline once unconfirmed for
     DOWNGRADE_GRACE_S. Never raises — on any error returns the inputs."""
-    p = Path(path) if path is not None else _latest_path()
+    p = Path(path) if path is not None else _latest_path(env)
     try:
         if now is None:
             import time as _t
@@ -538,7 +595,7 @@ def reconcile_account(used_5h, resets_5h, used_7d, resets_7d, path=None, now=Non
         return used_5h, resets_5h, used_7d, resets_7d
 
 
-def forecast(used_5h, resets_5h, used_7d, resets_7d, now: float):
+def forecast(used_5h, resets_5h, used_7d, resets_7d, now: float, env=None):
     """Compute (chip_5h, chip_7d). Reconciles against the shared account-global
     latest reading first (so all windows agree), then projects. Never raises."""
     try:
@@ -546,7 +603,7 @@ def forecast(used_5h, resets_5h, used_7d, resets_7d, now: float):
         # recording reconcile — persisting this echo would re-confirm the
         # stored reading every render and freeze the downgrade grace clock.
         u5, r5, u7, r7 = reconcile_account(used_5h, resets_5h, used_7d, resets_7d,
-                                           now=now, record=False)
+                                           now=now, record=False, env=env)
         c5 = forecast_chip("five_hour", u5, r5, now)
         c7 = forecast_chip("seven_day", u7, r7, now)
         return c5, c7
@@ -565,8 +622,8 @@ def empty_projection_store() -> Dict[str, Any]:
     }
 
 
-def load_projection_store(path=None) -> Dict[str, Any]:
-    p = Path(path) if path is not None else _projection_path()
+def load_projection_store(path=None, env=None) -> Dict[str, Any]:
+    p = Path(path) if path is not None else _projection_path(env)
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -590,8 +647,8 @@ def load_projection_store(path=None) -> Dict[str, Any]:
     return store
 
 
-def save_projection_store(store: Dict[str, Any], path=None) -> None:
-    p = Path(path) if path is not None else _projection_path()
+def save_projection_store(store: Dict[str, Any], path=None, env=None) -> None:
+    p = Path(path) if path is not None else _projection_path(env)
     from .cache import atomic_write_text
     atomic_write_text(p, json.dumps(store, separators=(",", ":")))
 
@@ -1078,13 +1135,13 @@ def _depletion_eta_seconds(used: float, ttr: float, raw_unclamped: float):
     return eta if eta < ttr else None
 
 
-def _projection_result_key(u5, r5, u7, r7) -> Optional[Tuple[str, str, float, float, float, float]]:
+def _projection_result_key(u5, r5, u7, r7, env=None) -> Optional[Tuple[str, str, float, float, float, float]]:
     try:
         return (
             # account-suffixed paths, so an account switch (or a monkeypatched
             # path in tests) invalidates the 1s result cache by key mismatch
-            str(_projection_path()),
-            str(_latest_path()),
+            str(_projection_path(env)),
+            str(_latest_path(env)),
             float(u5),
             float(r5),
             float(u7),
@@ -1163,13 +1220,13 @@ def _projection_for_window(store: Dict[str, Any], window: str, used_pct, resets_
     return chip
 
 
-def projection(used_5h, resets_5h, used_7d, resets_7d, now: float, session_id: str = ""):
+def projection(used_5h, resets_5h, used_7d, resets_7d, now: float, session_id: str = "", env=None):
     try:
         # record=False — same echo hazard as forecast(); see reconcile_account.
         u5, r5, u7, r7 = reconcile_account(used_5h, resets_5h, used_7d, resets_7d,
-                                           now=now, record=False)
+                                           now=now, record=False, env=env)
         ts = float(now)
-        key = _projection_result_key(u5, r5, u7, r7)
+        key = _projection_result_key(u5, r5, u7, r7, env)
         global _PROJECTION_RESULT_CACHE
         if key is not None and isinstance(_PROJECTION_RESULT_CACHE, dict):
             cached_at = _coerce(_PROJECTION_RESULT_CACHE.get("observed_at"))
@@ -1181,13 +1238,13 @@ def projection(used_5h, resets_5h, used_7d, resets_7d, now: float, session_id: s
                 result = _PROJECTION_RESULT_CACHE.get("result")
                 if isinstance(result, tuple) and len(result) == 2:
                     return result
-        store = load_projection_store()
-        since = regime_changed_at()
+        store = load_projection_store(env=env)
+        since = regime_changed_at(env=env)
         p5 = _projection_for_window(store, "five_hour", u5, r5, now, session_id,
                                     since=since)
         p7 = _projection_for_window(store, "seven_day", u7, r7, now, session_id,
                                     since=since)
-        save_projection_store(store)
+        save_projection_store(store, env=env)
         result = (p5, p7)
         if key is not None:
             _PROJECTION_RESULT_CACHE = {

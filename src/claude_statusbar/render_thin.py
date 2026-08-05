@@ -286,15 +286,21 @@ def _extract_session_id(payload: bytes) -> str:
     return sid
 
 
-# API-mode-relevant env vars. render_thin runs in the REAL session shell, but
+# Session-relevant env vars. render_thin runs in the REAL session shell, but
 # the shared daemon's os.environ is frozen at its own start and is not this
-# session's — so no-quota detection there must read the session env, not the
-# daemon's. We stamp these into the payload the daemon consumes.
+# session's — so no-quota detection AND account identity there must read the
+# session env, not the daemon's. We stamp these into the payload the daemon
+# consumes. CLAUDE_CONFIG_DIR relocates ~/.claude.json (Claude Code's documented
+# way to run multiple accounts on one machine) — without stamping it, the
+# daemon's frozen CLAUDE_CONFIG_DIR (or lack of one) would key every session's
+# 5h/7d cache off the SAME account regardless of which account each window is
+# actually logged into. See predict._claude_json_path / account_id.
 _SESSION_ENV_KEYS = (
     "ANTHROPIC_BASE_URL",
     "CS_API_MODE",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CONFIG_DIR",
 )
 
 
@@ -345,17 +351,30 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
 
 
 def _persist_stdin_bytes(data: bytes, session_id: str) -> None:
-    """Write the stdin payload to BOTH the per-session bucket (so daemon
-    renders this session) AND the legacy top-level file (for cs doctor /
-    preview / inline fallback compatibility).
+    """Write the stdin payload to the per-session bucket (so the daemon
+    renders this session), the legacy top-level file (for cs doctor /
+    preview / inline fallback compatibility), AND an account-scoped copy of
+    the legacy file.
 
     Why per-session: multiple Claude Code windows used to overwrite each
     other's last_stdin.json, making the daemon flip-flop. Per-session
     paths keep them isolated.
+
+    Why also account-scoped: core.parse_stdin_data() falls back to the legacy
+    top-level file when a session's live stdin has no rate_limits yet (session
+    just started). That file isn't session-scoped, so under one shared daemon
+    a different account's freshly-written blob could get read back as THIS
+    account's fallback. render_thin always runs in the real per-tick
+    environment (never the daemon's frozen one), so account_id() here is
+    always correct for this write — no `env=` needed.
     """
     session_stdin = _SESSIONS_DIR / _sanitize_session_id(session_id) / "last_stdin.json"
     _atomic_write_bytes(session_stdin, data)
     _atomic_write_bytes(_LEGACY_STDIN_CACHE, data)
+    from .predict import account_scoped_path
+    acct_stdin = account_scoped_path(_LEGACY_STDIN_CACHE)
+    if acct_stdin != _LEGACY_STDIN_CACHE:
+        _atomic_write_bytes(acct_stdin, data)
 
 
 # Spawn debounce (issue #31): mtime of this marker = last spawn attempt.

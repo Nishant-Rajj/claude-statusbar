@@ -21,6 +21,7 @@ DEFAULT_DENSITY = "regular"   # cozy | regular | compact
 DEFAULT_AUTO_COMPACT_WIDTH = 0  # 0 = disabled; otherwise force hairline below this width
 DEFAULT_CACHE_TTL_SECONDS = 300  # 5min — Anthropic's base prompt cache TTL.
 DEFAULT_CWD_STYLE = "basename"  # basename | full — how show_cwd renders the dir
+DEFAULT_ACCOUNT_STYLE = "email"  # email (default) | name | both — how show_account renders identity
 DEFAULT_API_MODE = "auto"  # auto-detect relay/Bedrock/Vertex | on (force) | off (force official)
 # DEPRECATED: the cache countdown now auto-detects the real TTL (5m vs 1h)
 # from the transcript's message.usage.cache_creation buckets, which reflect
@@ -56,6 +57,13 @@ class StatusbarConfig:
     # deliberately conservative about adding text (see #3).
     show_cwd: bool = False
     cwd_style: str = DEFAULT_CWD_STYLE  # basename (default) | full
+    # Logged-in account identity on the identity line (#multi-account). Opt-in,
+    # like show_cwd: this only matters on a machine running several accounts
+    # (e.g. different CLAUDE_CONFIG_DIR per shell) where it's otherwise unclear
+    # whose usage the bar is showing. "email" is the default because it's the
+    # field that actually disambiguates accounts; displayName can collide.
+    show_account: bool = False
+    account_style: str = DEFAULT_ACCOUNT_STYLE  # email (default) | name | both
     # Live-activity / session-stats segments. show_todos (activity line) and
     # show_lines (+added -removed on the identity line) default on; the rest are
     # opt-in so the line isn't crowded for users who didn't ask.
@@ -141,6 +149,8 @@ def load_config(path: Optional[Path] = None) -> StatusbarConfig:
         show_party=_to_bool(raw.get("show_party", True)),
         show_cwd=_to_bool(raw.get("show_cwd", False)),
         cwd_style=str(raw.get("cwd_style", DEFAULT_CWD_STYLE)),
+        show_account=_to_bool(raw.get("show_account", False)),
+        account_style=str(raw.get("account_style", DEFAULT_ACCOUNT_STYLE)),
         show_todos=_to_bool(raw.get("show_todos", True)),
         show_tools=_to_bool(raw.get("show_tools", False)),
         show_tool_rollup=_to_bool(raw.get("show_tool_rollup", False)),
@@ -179,6 +189,7 @@ VALID_KEYS = {
     "show_cache_age",
     "show_project_branch", "show_party",
     "show_cwd", "cwd_style",
+    "show_account", "account_style",
     "show_todos", "show_tools", "show_tool_rollup", "show_agents",
     "show_ip_risk", "show_fp_risk",
     "show_duration", "show_lines", "show_ahead_behind", "show_version",
@@ -194,6 +205,7 @@ _BOOL_KEYS = {"show_weekly", "show_language", "show_cost", "show_balance",
               "show_cache_age",
               "show_project_branch", "show_party",
               "show_cwd",
+              "show_account",
               "show_todos", "show_tools", "show_tool_rollup", "show_agents",
               "show_ip_risk", "show_fp_risk",
               "show_duration", "show_lines", "show_ahead_behind", "show_version",
@@ -204,6 +216,7 @@ _INT_KEYS = {"auto_compact_width", "cache_ttl_seconds"}
 _COLOR_KEYS = {"color_ok", "color_warn", "color_hot"}
 _VALID_DENSITY = {"compact", "regular", "cozy"}
 _VALID_CWD_STYLE = {"basename", "full"}
+_VALID_ACCOUNT_STYLE = {"email", "name", "both"}
 
 
 def set_value(key: str, value: str, path: Optional[Path] = None) -> StatusbarConfig:
@@ -267,6 +280,10 @@ def set_value(key: str, value: str, path: Optional[Path] = None) -> StatusbarCon
     elif key == "cwd_style":
         if value not in _VALID_CWD_STYLE:
             raise ValueError(f"cwd_style must be one of {sorted(_VALID_CWD_STYLE)}, got {value!r}")
+        setattr(cfg, key, value)
+    elif key == "account_style":
+        if value not in _VALID_ACCOUNT_STYLE:
+            raise ValueError(f"account_style must be one of {sorted(_VALID_ACCOUNT_STYLE)}, got {value!r}")
         setattr(cfg, key, value)
     elif key == "style":
         # Lazy import to avoid a config↔styles cycle at module load.

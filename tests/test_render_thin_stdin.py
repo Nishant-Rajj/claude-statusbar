@@ -107,3 +107,19 @@ def test_session_id_survives_the_bounded_read(monkeypatch):
 ])
 def test_payload_completeness_check(buf, expected):
     assert render_thin._payload_is_complete(buf) is expected
+
+
+def test_session_env_stamp_includes_claude_config_dir(monkeypatch):
+    """CLAUDE_CONFIG_DIR must be stamped into `_cs_env` alongside the API-mode
+    vars: the shared daemon's own os.environ is frozen at its start, so
+    account identity (keyed off $CLAUDE_CONFIG_DIR/.claude.json) needs the
+    real per-session value the same way no-quota detection already does."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/some-account-config")
+    stamped = json.loads(render_thin._inject_session_env(PAYLOAD))
+    assert stamped["_cs_env"]["CLAUDE_CONFIG_DIR"] == "/tmp/some-account-config"
+
+
+def test_session_env_stamp_omits_unset_claude_config_dir(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    stamped = json.loads(render_thin._inject_session_env(PAYLOAD))
+    assert "CLAUDE_CONFIG_DIR" not in stamped["_cs_env"]
